@@ -1,13 +1,11 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
+*py.class
 env/
 venv/
 .venv/
 chroma_db/
-Sample_PDFs/
-pdfs/
 *.gguf
 
 # Node
