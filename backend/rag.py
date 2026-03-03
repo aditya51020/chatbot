@@ -469,6 +469,8 @@ def extract_key_info(text: str) -> dict:
                 continue
 
         elif key == "Ref. Number":
+            # stop at lowercase words (e.g. 'panchayat samiti'), keep uppercase codes (e.g. 'UITBH_295273')
+            val = re.split(r'\s+(?=[a-z]{4,})', val)[0].strip()
             val = re.sub(r'-?[A-Za-z]{1,4}$', '', val).strip('-').strip()
             if len(val) < 3:
                 continue
