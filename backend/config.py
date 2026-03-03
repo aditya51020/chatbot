@@ -20,7 +20,7 @@ GPT4ALL_MODEL = "Phi-3-mini-4k-instruct.Q4_0.gguf"
 # ── RAG settings ──────────────────────────────────────────────────────────
 CHUNK_SIZE    = 200   # reduced: tighter chunks = more focused retrieval per page
 CHUNK_OVERLAP = 40    # overlap preserves context between adjacent chunks
-TOP_K         = 8     # tighter: fewer but more relevant chunks per query
+TOP_K         = 6     # tighter: fewer but more relevant chunks per query
 
 # ── ChromaDB collection name ───────────────────────────────────────────────
 COLLECTION_NAME = "land_docs"

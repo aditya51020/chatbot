@@ -262,17 +262,11 @@ export default function App() {
     const [messages, setMessages] = useState([{
         id: 0,
         role: 'bot',
-        content: `**🏛️ Land Records Assistant — आपका स्वागt है!**
+        content: `**Land Records Assistant**
 
-अपने land records, भूखंड, जमाराशि, या agency records के बारे में कुछ भी पूछें — **Hindi, Hinglish, या English** में:
+कुछ भी पूछें — Hindi, Hinglish, या English में। भूखंड, जमाराशि, agency name, tender amount, work order — सब मिलेगा।
 
-- 📍 भूखंड संख्या, साइज, जमाराशि
-- 🏗️ Agency name, casting date, tender amount
-- 📄 Work order, ref number, scheme name
-
-**🔍 Filter:** नीचे filter bar से एक specific PDF चुनें — अो सिर्फ उसी file में search किया जाएगा।
-
-**✍️ Spelling:** Galat spelling या typo भी चलेगा — मैं खुद समझ जाता हूँ!`,
+Filter bar से specific PDF चुन सकते हैं। Galat spelling भी चलेगी।`,
         sources: [],
         table: [],
         sourcesDetail: [],
@@ -477,21 +471,6 @@ export default function App() {
             </main>
 
             <div className="input-area">
-                {/* Quick Suggestion Chips */}
-                {messages.length <= 1 && !input && (
-                    <div className="suggestions">
-                        {suggestions.map((s, i) => (
-                            <button
-                                key={i}
-                                className="suggestion-chip"
-                                onClick={() => handleSuggestion(s)}
-                                disabled={loading}
-                            >
-                                {s}
-                            </button>
-                        ))}
-                    </div>
-                )}
                 <div className="input-box">
                     <textarea
                         ref={inputRef}

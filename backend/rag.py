@@ -88,7 +88,7 @@ def get_chunk_count() -> int:
 
 # ── Retrieval ──────────────────────────────────────────────────────────────
 
-RELEVANCE_THRESHOLD = 0.45
+RELEVANCE_THRESHOLD = 0.55
 
 
 # Devanagari digit map: ०→0 … ९→9
@@ -240,6 +240,18 @@ def _plot_id_boost(chunk_text: str, query: str) -> float:
     return 0.0
 
 
+def _extract_person_names(query: str) -> list[str]:
+    """
+    Pull out multi-word proper names from the query (e.g. 'chandmal somani').
+    Returns a list of individual name words (>=4 chars, not common keywords).
+    """
+    _SKIP = {'agency', 'name', 'contractor', 'bidder', 'kya', 'hai', 'tender',
+             'amount', 'number', 'date', 'casting', 'plot', 'size', 'jankari',
+             'work', 'order', 'bid', 'ref', 'division', 'scheme', 'yojana'}
+    words = re.findall(r'[A-Za-z\u0900-\u097F]{4,}', query)
+    return [w.lower() for w in words if w.lower() not in _SKIP]
+
+
 def retrieve_context(
     query: str,
     filename_filter: str | None = None,
@@ -251,6 +263,7 @@ def retrieve_context(
     2. One sub-query per detected intent
     3. Chunks with query keywords get a small boost
     4. Chunks with exact plot IDs get a strong boost
+    5. Person-name filter: if query has a specific name, drop chunks not mentioning it
 
     filename_filter / category_filter — when set, restricts retrieval to that
     document or category (passed straight to ChromaDB metadata filter).
@@ -281,6 +294,21 @@ def retrieve_context(
                 all_chunks.append(chunk)
 
     all_chunks.sort(key=lambda c: c["score"], reverse=True)
+
+    # ── Person-name filter ────────────────────────────────────────────────
+    # If the query mentions a specific person/firm name, only keep chunks
+    # that contain at least one of those name words. Prevents pulling in
+    # completely unrelated records (e.g. CS.pdf for a query about Somani).
+    person_words = _extract_person_names(query)
+    if person_words and not filename_filter:
+        filtered = [
+            c for c in all_chunks
+            if any(pw in c["text"].lower() for pw in person_words)
+        ]
+        if filtered:  # only apply if at least one chunk passes
+            print(f"  [name-filter] {len(filtered)}/{len(all_chunks)} chunks kept for names: {person_words}")
+            all_chunks = filtered
+
     return all_chunks
 
 
@@ -358,7 +386,7 @@ def extract_key_info(text: str) -> dict:
         "Date of Testing":  r"(?i)Date\s*of\s*Testing\s*[:\-=]+\s*([\d.\-/]{6,12})",
         # Numeric reference fields
         "W.O. Number":      r"(?i)W\.?O\.?\s*No\.?\s*[:\-/=]+\s*([\d\-/]{3,20})",
-        "Ref. Number":      r"(?i)(?:Ref\.?\s*No\.?|NIT)\s*[:\-=]*\s*([\w\-/]{3,25})",
+        "Ref. Number":      r"(?i)(?:Ref\.?\s*No\.?|NIT|Bid\s*No\.?)\s*[:\-=]*\s*([\w][\w\s\-/.]{2,30})",
         # ── Housing / Land plot fields ──────────────────────────────────────
         # Plot Number: must be immediately after the label and be a short standalone value (≤6 chars)
         # This prevents account/reference numbers like 32436 being picked as plot 436.
@@ -874,7 +902,12 @@ def detect_intent(query: str) -> list[str]:
     if re.search(r'allot|आवंटित|patta|पट्टा|holder|khattedar|खातेदार|malik|मालिक', q):
         intents.append("Allottee Name")
     # ── Tender / Financial intents ─────────────────────────────────────────
-    if re.search(r'tender|bid|l1|lowest|contract\s*price|kitne\s*rupay|kitna\s*amount|amount', q):
+    # 'bid no' = asking for the bid/NIT reference number; 'bid amount/tender' = money
+    if re.search(r'bid\s*no|bid\s*number|nit\s*no', q):
+        intents.append("Ref. Number")
+    elif re.search(r'tender|bid\s*amount|l1\b|lowest|contract\s*price|kitne\s*rupay|kitna\s*amount', q):
+        intents.append("Tender Amount")
+    elif re.search(r'\bbid\b|amount', q):
         intents.append("Tender Amount")
     if re.search(r'below\s*schedule|schedule|discount|percent|%|kitna\s*kam|rate', q):
         intents.append("Schedule Discount")
@@ -1138,7 +1171,10 @@ def format_answer(query: str, chunks: list[dict]) -> str:
     # pages of the matched file are scanned — the English BoQ page (Bidder Name,
     # Tender Amount, Schedule Discount) may be on a different page from the
     # Hindi text page that embedding search returned first.
-    run_pass2 = bool(missing_intents) or (not intents and not all_info)
+    # Only run exhaustive Pass-2 if 2+ intents are still missing, or no
+    # intents at all AND nothing was extracted. Avoids slow full-file scans
+    # for queries that already have their main field answered.
+    run_pass2 = (len(missing_intents) >= 2) or (not intents and not all_info)
 
     if run_pass2 and chunks:
         # ── Choose the CORRECT file for Pass-2 ──────────────────────────
@@ -1160,14 +1196,13 @@ def format_answer(query: str, chunks: list[dict]) -> str:
                 print(f"  [pass-2] All missing fields found. Stopping early.")
                 break
 
-    # Pass 3: Phi-3-mini LLM (smarter prompt + quality check)
+    # Pass 3: Phi-3-mini LLM for natural-language answer (falls back to regex template if unavailable)
     llm_result = _llm_answer(query, chunks, extracted_fields=all_info or None)
     if llm_result:
-        # Prepend source attribution
         src_str = sources[0].split("/")[-1].strip() if sources else "the indexed document"
         return f"**Source:** {src_str}\n\n{llm_result}"
 
-    # ── Fallback: regex-template answer ──────────────────────────────────
+    # Fallback: regex-template answer
     return build_natural_answer(query, all_info, sources, chunks)
 
 
