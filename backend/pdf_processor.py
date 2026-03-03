@@ -3,21 +3,36 @@ import fitz  # PyMuPDF
 from config import PDF_ROOT, PDF_DIR, CHUNK_SIZE, CHUNK_OVERLAP
 
 
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extract all text from a PDF (works with searchable/OCR PDFs)."""
+def extract_pages_from_pdf(pdf_path: str) -> list[tuple[int, str]]:
+    """
+    Extract text page-by-page from a PDF.
+    Returns list of (page_number, text) tuples (1-indexed).
+    Only returns pages that have actual text content.
+    """
     doc = fitz.open(pdf_path)
-    full_text = []
+    pages = []
     for page_num, page in enumerate(doc):
         text = page.get_text("text")
         if text.strip():
-            full_text.append(f"[Page {page_num + 1}]\n{text}")
+            pages.append((page_num + 1, text))
     doc.close()
-    return "\n".join(full_text)
+    return pages
 
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split text into overlapping word chunks."""
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """Extract all text from a PDF (works with searchable/OCR PDFs)."""
+    pages = extract_pages_from_pdf(pdf_path)
+    return "\n".join(f"[Page {num}]\n{text}" for num, text in pages)
+
+
+def _split_long_page(text: str, chunk_size: int, overlap: int) -> list[str]:
+    """
+    Sub-split a single page's text by word count when it is too long.
+    Used only when a single page exceeds chunk_size words.
+    """
     words = text.split()
+    if len(words) <= chunk_size:
+        return [text]
     chunks = []
     start = 0
     while start < len(words):
@@ -26,6 +41,40 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         if end == len(words):
             break
         start += chunk_size - overlap
+    return chunks
+
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """
+    Split text into chunks, respecting page boundaries.
+    Each [Page N] block becomes its own chunk(s).
+    If a page is very long it is sub-split by word count.
+    Kept for backward compatibility (used by upload path).
+    """
+    # Split on [Page N] markers that were inserted by extract_text_from_pdf
+    import re
+    page_blocks = re.split(r'\[Page \d+\]\n?', text)
+    # First element before any [Page] tag is the metadata header (if any)
+    header = page_blocks[0] if page_blocks else ""
+    chunks = []
+    for block in page_blocks[1:]:
+        block = block.strip()
+        if not block:
+            continue
+        sub = _split_long_page(block, chunk_size, overlap)
+        for s in sub:
+            # Keep the metadata header attached to every sub-chunk
+            chunks.append((header.strip() + "\n" + s).strip() if header.strip() else s)
+    # Fallback: if no [Page] markers found, use old word-count split
+    if not chunks:
+        words = text.split()
+        start = 0
+        while start < len(words):
+            end = min(start + chunk_size, len(words))
+            chunks.append(" ".join(words[start:end]))
+            if end == len(words):
+                break
+            start += chunk_size - overlap
     return chunks
 
 
@@ -55,36 +104,49 @@ def get_metadata_from_path(pdf_path: str, root: str) -> dict:
 def process_pdf(pdf_path: str, root: str = None) -> list[dict]:
     """
     Process a single PDF → list of chunk dicts with rich metadata.
+    Chunks by page: one chunk per page (sub-split if page is very long).
+    Metadata header is prepended to EVERY chunk so retrieval always knows the case.
     """
     meta = get_metadata_from_path(pdf_path, root or PDF_ROOT)
     label = f"{meta['category']} / {meta['case_number']} / {meta['doc_type']}"
     print(f"  📄 Processing: {label}")
 
-    raw_text = extract_text_from_pdf(pdf_path)
-    if not raw_text.strip():
+    pages = extract_pages_from_pdf(pdf_path)
+    if not pages:
         print(f"  ⚠️  No text found in {label} (image-only PDF?)")
         return []
 
-    # Prepend metadata header so LLM knows context of each chunk
+    # Metadata header — prepended to every chunk so every retrieval result is self-contained
     header = (
         f"[Category: {meta['category']}] "
         f"[Case: {meta['case_number']}] "
-        f"[Type: {meta['doc_type']}]\n"
+        f"[Type: {meta['doc_type']}]"
     )
-    chunks = chunk_text(header + raw_text)
 
     result = []
-    for i, chunk in enumerate(chunks):
-        result.append({
-            "text":        chunk,
-            "filename":    f"{meta['category']}/{meta['case_number']}/{meta['doc_type']}/{meta['filename']}",
-            "category":    meta["category"],
-            "case_number": meta["case_number"],
-            "doc_type":    meta["doc_type"],
-            "chunk_index": i
-        })
+    chunk_index = 0
+    for page_num, page_text in pages:
+        page_text = page_text.strip()
+        if not page_text:
+            continue
 
-    print(f"  ✅ {label} → {len(chunks)} chunks")
+        # Sub-split only if page exceeds CHUNK_SIZE words
+        sub_chunks = _split_long_page(page_text, CHUNK_SIZE, CHUNK_OVERLAP)
+
+        for sub in sub_chunks:
+            full_chunk = f"{header}\n[Page {page_num}]\n{sub}"
+            result.append({
+                "text":        full_chunk,
+                "filename":    f"{meta['category']}/{meta['case_number']}/{meta['doc_type']}/{meta['filename']}",
+                "category":    meta["category"],
+                "case_number": meta["case_number"],
+                "doc_type":    meta["doc_type"],
+                "chunk_index": chunk_index,
+                "page_number": page_num,
+            })
+            chunk_index += 1
+
+    print(f"  ✅ {label} → {len(result)} chunks from {len(pages)} pages")
     return result
 
 

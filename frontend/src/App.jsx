@@ -2,254 +2,336 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
-    Send,
-    Bot,
-    User,
-    FileText,
-    Search,
-    Loader2,
-    Moon,
-    Sun,
-    Mic,
-    MicOff,
-    Maximize2,
-    X,
-    ExternalLink
+    Send, Bot, User, FileText, Search,
+    Loader2, Moon, Sun, Mic, MicOff,
+    Maximize2, X, ExternalLink, ChevronDown, ChevronUp,
+    Filter, FolderOpen
 } from 'lucide-react'
 import './App.css'
 
 const API = '/api'
 
-// --- Components ---
-
+// ── PDF Preview Modal ────────────────────────────────────────────────────
 function PDFModal({ isOpen, fileUrl, fileName, onClose }) {
     if (!isOpen) return null
-
     return (
         <div className="modal-overlay" onClick={onClose}>
-            <div className="modal-content" onClick={e => e.stopPropagation()}>
-                <div className="modal-header">
+            <div className="modal-panel" onClick={e => e.stopPropagation()}>
+                <div className="modal-bar">
                     <div className="modal-title">
-                        <FileText size={18} />
+                        <FileText size={15} />
                         <span>{fileName}</span>
                     </div>
-                    <div className="modal-actions">
-                        <a href={fileUrl} target="_blank" rel="noreferrer" className="action-btn">
-                            <ExternalLink size={18} />
+                    <div className="modal-controls">
+                        <a href={fileUrl} target="_blank" rel="noreferrer"
+                            className="icon-btn" title="Open in new tab">
+                            <ExternalLink size={15} />
                         </a>
-                        <button onClick={onClose} className="action-btn close">
-                            <X size={20} />
+                        <button className="icon-btn" onClick={onClose} title="Close">
+                            <X size={16} />
                         </button>
                     </div>
                 </div>
                 <div className="modal-body">
-                    <iframe src={fileUrl} title={fileName} width="100%" height="100%" />
+                    <iframe src={fileUrl} title={fileName} />
                 </div>
             </div>
         </div>
     )
 }
 
-function Header({ ready, darkMode, onToggleDark }) {
+// ── Top Bar ──────────────────────────────────────────────────────────────
+function TopBar({ ready, dark, onToggleDark }) {
     return (
-        <header>
+        <header className="topbar">
             <div className="brand">
-                <div className="brand-icon">
-                    <Search size={20} />
+                <div className="brand-logo"><Search size={16} /></div>
+                <div>
+                    <div className="brand-name">Land Records Assistant</div>
+                    <div className="brand-sub">Document Intelligence</div>
                 </div>
-                <h1>Land Records Assistant</h1>
             </div>
-            <div className="header-right">
-                <button className="icon-btn theme-toggle" onClick={onToggleDark} title="Toggle Dark Mode">
-                    {darkMode ? <Sun size={20} /> : <Moon size={20} />}
+            <div className="topbar-right">
+                <button className="icon-btn" onClick={onToggleDark} title="Toggle theme">
+                    {dark ? <Sun size={16} /> : <Moon size={16} />}
                 </button>
-                <div className={`status-badge ${ready ? 'ready' : ''}`}>
-                    <div className="status-dot" />
-                    {ready ? 'System Ready' : 'Initializing...'}
+                <div className={`status-pill ${ready ? 'online' : ''}`}>
+                    <span className="status-dot" />
+                    {ready ? 'Ready' : 'Loading'}
                 </div>
             </div>
         </header>
     )
 }
 
+// ── Filter Bar ──────────────────────────────────────────────────────────
+function FilterBar({ docs, activeFilter, onFilter }) {
+    if (!docs || docs.length === 0) return null
+
+    // Show just the filename (last path part); deduplicate by basename
+    const getName = (path) => path.split(/[/\\]/).pop()
+    const seen = new Set()
+    const uniqueDocs = docs.filter(doc => {
+        const name = getName(doc)
+        if (seen.has(name)) return false
+        seen.add(name)
+        return true
+    })
+
+    return (
+        <div className="filter-bar">
+            <span className="filter-label">
+                <Filter size={11} />
+                Filter:
+            </span>
+            <button
+                className={`filter-chip ${!activeFilter ? 'active' : ''}`}
+                onClick={() => onFilter(null)}
+            >
+                All docs
+            </button>
+            {uniqueDocs.map((doc, i) => {
+                const name = getName(doc)
+                return (
+                    <button
+                        key={i}
+                        className={`filter-chip ${activeFilter === doc ? 'active' : ''}`}
+                        onClick={() => onFilter(activeFilter === doc ? null : doc)}
+                        title={doc}
+                    >
+                        <FileText size={10} />
+                        {name}
+                    </button>
+                )
+            })}
+        </div>
+    )
+}
+
+
+// ── Discovery Card ───────────────────────────────────────────────────────
+function DiscoveryCard({ table }) {
+    if (!table?.length) return null
+
+    const merged = {}
+    table.forEach(row => {
+        Object.entries(row).forEach(([k, v]) => {
+            if (k !== 'Source' && !merged[k] && v && v !== '-') merged[k] = v
+        })
+    })
+
+    const entries = Object.entries(merged)
+    if (!entries.length) return null
+
+    const sources = [...new Set(table.map(r => r.Source).filter(Boolean))]
+
+    return (
+        <div className="discovery-card">
+            <div className="discovery-header">Extracted Information</div>
+            <table className="discovery-table">
+                <tbody>
+                    {entries.map(([key, val]) => (
+                        <tr key={key}>
+                            <th>{key}</th>
+                            <td>{val}</td>
+                        </tr>
+                    ))}
+                    {sources.length > 0 && (
+                        <tr>
+                            <th>Source</th>
+                            <td>{sources.join(', ')}</td>
+                        </tr>
+                    )}
+                </tbody>
+            </table>
+        </div>
+    )
+}
+
+// ── Read More Panel ──────────────────────────────────────────────────────
+function ReadMorePanel({ detail }) {
+    const [open, setOpen] = useState(false)
+    if (!detail) return null
+
+    return (
+        <div className="read-more">
+            <button
+                className="read-more-toggle"
+                onClick={() => setOpen(o => !o)}
+            >
+                {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                {open ? 'Show less' : 'Read more — detailed passage'}
+            </button>
+            {open && (
+                <div className="read-more-body">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {detail}
+                    </ReactMarkdown>
+                </div>
+            )}
+        </div>
+    )
+}
+
+// ── Message Bubble ───────────────────────────────────────────────────────
 function MessageBubble({ msg, onPreview }) {
     const isBot = msg.role === 'bot'
 
-    const getFileUrl = (path) => {
-        // Ensure we handle both backslashes and forward slashes
-        const normalizedPath = path.replace(/\\/g, '/')
-
-        // If it's a local sample PDF (has category/case structure), it's in /docs/samples
-        if (normalizedPath.split('/').length > 1) {
-            return `${API}/docs/samples/${normalizedPath}`
-        }
-        // Fallback for simple uploads
-        return `${API}/docs/uploads/${normalizedPath}`
+    const getFileUrl = path => {
+        const p = path.replace(/\\/g, '/')
+        return p.split('/').length > 1
+            ? `${API}/docs/samples/${p}`
+            : `${API}/docs/uploads/${p}`
     }
 
     return (
         <div className={`message ${isBot ? 'bot' : 'user'}`}>
             <div className="avatar">
-                {isBot ? <Bot size={18} /> : <User size={18} />}
+                {isBot ? <Bot size={15} /> : <User size={15} />}
             </div>
+
             <div className="bubble">
                 {msg.loading ? (
-                    <div className="typing-dots">
+                    <div className="typing">
                         <span /><span /><span />
                     </div>
                 ) : (
-                    <div className="bubble-text">
-                        {/* 1. Summary Table (if exists) */}
-                        {isBot && msg.table?.length > 0 && (
-                            <div className="summary-table-container">
-                                <h3>📊 Key Discovery</h3>
-                                <table>
-                                    <thead>
-                                        <tr>
-                                            <th>Source</th>
-                                            {/* Extract all unique keys from all rows, excluding 'Source' */}
-                                            {Array.from(new Set(msg.table.flatMap(row => Object.keys(row)).filter(k => k !== 'Source')))
-                                                .map(key => <th key={key}>{key}</th>)}
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {msg.table.map((row, i) => {
-                                            const otherKeys = Array.from(new Set(msg.table.flatMap(r => Object.keys(r)).filter(k => k !== 'Source')));
-                                            return (
-                                                <tr key={i}>
-                                                    <td>{row.Source}</td>
-                                                    {otherKeys.map(key => <td key={key}>{row[key] || "-"}</td>)}
-                                                </tr>
-                                            );
-                                        })}
-                                    </tbody>
-                                </table>
-                            </div>
-                        )}
+                    <>
+                        {/* Structured extraction card */}
+                        {isBot && <DiscoveryCard table={msg.table} />}
 
-                        {/* 2. Main AI Content */}
-                        <div className="main-content">
+                        {/* Main answer */}
+                        <div className="md-content">
                             {isBot ? (
                                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                    {msg.content || (msg.loading ? '...' : '')}
+                                    {msg.content || ''}
                                 </ReactMarkdown>
                             ) : (
                                 msg.content
                             )}
                         </div>
 
-                        {/* 3. Source citations with previews */}
-                        {isBot && (msg.sources?.length > 0 || msg.sourcesDetail?.length > 0) && (
+                        {/* Read More — expandable raw passage */}
+                        {isBot && msg.detail && (
+                            <ReadMorePanel detail={msg.detail} />
+                        )}
+
+                        {/* Source chips — deduplicated by filename */}
+                        {isBot && (msg.sourcesDetail?.length > 0 || msg.sources?.length > 0) && (
                             <div className="sources">
-                                <div className="sources-label">Sources:</div>
-                                {(msg.sourcesDetail || msg.sources || []).map((s, i) => {
-                                    const path = typeof s === 'string' ? s : s.filename
-                                    const name = path.split(/[\\/]/).pop()
-                                    const url = getFileUrl(path)
-                                    return (
-                                        <button
-                                            key={i}
-                                            className="source-tag clickable"
-                                            onClick={() => onPreview(url, name)}
-                                            title="Open Preview"
-                                        >
-                                            <FileText size={12} />
-                                            {name}
-                                            <Maximize2 size={10} style={{ marginLeft: '4px' }} />
-                                        </button>
-                                    )
-                                })}
+                                <div className="sources-label">Sources</div>
+                                {(() => {
+                                    const raw = msg.sourcesDetail || msg.sources || []
+                                    const seen = new Set()
+                                    return raw
+                                        .filter(s => {
+                                            const path = typeof s === 'string' ? s : s.filename
+                                            const name = path.split(/[/\\]/).pop()
+                                            if (seen.has(name)) return false
+                                            seen.add(name)
+                                            return true
+                                        })
+                                        .map((s, i) => {
+                                            const path = typeof s === 'string' ? s : s.filename
+                                            const name = path.split(/[/\\]/).pop()
+                                            return (
+                                                <button
+                                                    key={i}
+                                                    className="source-chip"
+                                                    onClick={() => onPreview(getFileUrl(path), name)}
+                                                    title="View document"
+                                                >
+                                                    <FileText size={11} />
+                                                    {name}
+                                                    <Maximize2 size={10} />
+                                                </button>
+                                            )
+                                        })
+                                })()}
                             </div>
                         )}
-                    </div>
+                    </>
                 )}
             </div>
         </div>
     )
 }
 
+// ── App ──────────────────────────────────────────────────────────────────
 export default function App() {
-    const [messages, setMessages] = useState([
-        {
-            id: 0,
-            role: 'bot',
-            content: '## Namaste! 🙏\n\nMain aapka Land Records Assistant hoon. Main aapke PDFs se **100% accurate extraction** aur **Key Discovery tables** generate karta hoon.\n\nAap mic button ka use karke bhi sawaal pooch sakte hain!',
-            sources: []
-        }
-    ])
+    const [messages, setMessages] = useState([{
+        id: 0,
+        role: 'bot',
+        content: `**🏛️ Land Records Assistant — आपका स्वागt है!**
+
+अपने land records, भूखंड, जमाराशि, या agency records के बारे में कुछ भी पूछें — **Hindi, Hinglish, या English** में:
+
+- 📍 भूखंड संख्या, साइज, जमाराशि
+- 🏗️ Agency name, casting date, tender amount
+- 📄 Work order, ref number, scheme name
+
+**🔍 Filter:** नीचे filter bar से एक specific PDF चुनें — अो सिर्फ उसी file में search किया जाएगा।
+
+**✍️ Spelling:** Galat spelling या typo भी चलेगा — मैं खुद समझ जाता हूँ!`,
+        sources: [],
+        table: [],
+        sourcesDetail: [],
+        detail: null
+    }])
     const [input, setInput] = useState('')
     const [loading, setLoading] = useState(false)
     const [ready, setReady] = useState(false)
-    const [darkMode, setDarkMode] = useState(localStorage.getItem('theme') === 'dark')
-    const [isListening, setIsListening] = useState(false)
-
-    // PDF Preview State
-    const [previewFile, setPreviewFile] = useState({ isOpen: false, url: '', name: '' })
+    const [dark, setDark] = useState(localStorage.getItem('theme') === 'dark')
+    const [listening, setListening] = useState(false)
+    const [preview, setPreview] = useState({ open: false, url: '', name: '' })
+    const [docList, setDocList] = useState([])
+    const [activeFilter, setActiveFilter] = useState(null)
 
     const bottomRef = useRef(null)
     const inputRef = useRef(null)
-    const recognition = useRef(null)
+    const recognRef = useRef(null)
+
+    useEffect(() => { document.body.classList.toggle('dark', dark) }, [dark])
 
     const checkStatus = useCallback(async () => {
         try {
-            const res = await fetch(`${API}/status`)
-            const data = await res.json()
-            setReady(data.ready)
-        } catch (err) {
-            console.error("Status check failed:", err)
-        }
+            const r = await fetch(`${API}/status`)
+            const d = await r.json()
+            setReady(d.ready)
+            if (d.indexed_documents?.length) {
+                setDocList(d.indexed_documents)
+            }
+        } catch { /* server not yet up */ }
     }, [])
 
+    useEffect(() => { checkStatus() }, [checkStatus])
     useEffect(() => {
-        checkStatus()
-        if (darkMode) {
-            document.body.classList.add('dark-mode')
-        } else {
-            document.body.classList.remove('dark-mode')
-        }
-    }, [checkStatus, darkMode])
+        bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }, [messages])
 
-    useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
-
-    // --- Voice Recognition ---
+    // Voice recognition
     useEffect(() => {
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
-        if (SpeechRecognition) {
-            recognition.current = new SpeechRecognition()
-            recognition.current.continuous = false
-            recognition.current.interimResults = false
-            recognition.current.lang = 'hi-IN' // Support Hindi/English
-
-            recognition.current.onresult = (event) => {
-                const transcript = event.results[0][0].transcript
-                setInput(transcript)
-                setIsListening(false)
-            }
-
-            recognition.current.onerror = (event) => {
-                console.error("Speech Recognition Error:", event.error)
-                setIsListening(false)
-            }
-
-            recognition.current.onend = () => {
-                setIsListening(false)
-            }
-        }
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition
+        if (!SR) return
+        const r = new SR()
+        r.continuous = false
+        r.interimResults = false
+        r.lang = 'hi-IN'
+        r.onresult = e => { setInput(e.results[0][0].transcript); setListening(false) }
+        r.onerror = () => setListening(false)
+        r.onend = () => setListening(false)
+        recognRef.current = r
     }, [])
 
     const toggleListen = () => {
-        if (isListening) {
-            recognition.current?.stop()
-        } else {
-            setIsListening(true)
-            recognition.current?.start()
-        }
+        if (listening) recognRef.current?.stop()
+        else { setListening(true); recognRef.current?.start() }
     }
 
-    const toggleDarkMode = () => {
-        const newMode = !darkMode
-        setDarkMode(newMode)
-        localStorage.setItem('theme', newMode ? 'dark' : 'light')
+    const toggleDark = () => {
+        const next = !dark
+        setDark(next)
+        localStorage.setItem('theme', next ? 'dark' : 'light')
     }
 
     const handleSend = async () => {
@@ -259,141 +341,200 @@ export default function App() {
         const userMsg = { id: Date.now(), role: 'user', content: query }
         const botId = Date.now() + 1
         const botMsg = {
-            id: botId,
-            role: 'bot',
-            content: '',
-            sources: [],
-            loading: true,
-            table: [],
-            sourcesDetail: []
+            id: botId, role: 'bot', content: '',
+            loading: true, table: [], sources: [], sourcesDetail: [], detail: null
         }
 
         setMessages(prev => [...prev, userMsg, botMsg])
         setInput('')
+        // Reset textarea height back to single row after clearing
+        if (inputRef.current) {
+            inputRef.current.style.height = ''
+        }
         setLoading(true)
 
         try {
-            const response = await fetch(`${API}/chat`, {
+            const res = await fetch(`${API}/chat`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query })
+                body: JSON.stringify({
+                    query,
+                    ...(activeFilter ? { filename_filter: activeFilter } : {}),
+                })
             })
+            if (!res.ok) throw new Error(`Server error ${res.status}`)
 
-            if (!response.ok) throw new Error('Server error')
-
-            const reader = response.body.getReader()
+            const reader = res.body.getReader()
             const decoder = new TextDecoder()
             let buffer = ''
 
-            setMessages(prev => prev.map(m => m.id === botId ? { ...m, loading: false } : m))
+            setMessages(prev => prev.map(m =>
+                m.id === botId ? { ...m, loading: false } : m
+            ))
 
             while (true) {
                 const { value, done } = await reader.read()
                 if (done) break
-
                 buffer += decoder.decode(value, { stream: true })
                 const lines = buffer.split('\n')
-                buffer = lines.pop() // keep partial line in buffer
+                buffer = lines.pop()
 
                 for (const line of lines) {
                     if (!line.trim()) continue
                     try {
                         const chunk = JSON.parse(line)
-
                         setMessages(prev => prev.map(m => {
                             if (m.id !== botId) return m
-
-                            if (chunk.type === 'meta') {
+                            if (chunk.type === 'meta')
                                 return { ...m, table: chunk.table, sources: chunk.sources }
-                            }
-                            if (chunk.type === 'content') {
+                            if (chunk.type === 'content')
                                 return { ...m, content: m.content + chunk.content }
-                            }
-                            if (chunk.type === 'sources_detail') {
+                            if (chunk.type === 'detail')
+                                return { ...m, detail: chunk.content }
+                            if (chunk.type === 'sources_detail')
                                 return { ...m, sourcesDetail: chunk.content }
-                            }
-                            if (chunk.type === 'error') {
-                                return { ...m, content: `### ❌ Error\n\n${chunk.content}` }
-                            }
+                            if (chunk.type === 'error')
+                                return { ...m, content: chunk.content }
                             return m
                         }))
-                    } catch (e) {
-                        console.error("Error parsing stream chunk:", e)
-                    }
+                    } catch { /* skip malformed line */ }
                 }
             }
         } catch (e) {
             setMessages(prev => prev.map(m =>
-                m.id === botId ? {
-                    ...m,
-                    content: `### ❌ Error\n\n${e.message}`,
-                    loading: false
-                } : m
+                m.id === botId
+                    ? { ...m, content: `Something went wrong: ${e.message}`, loading: false }
+                    : m
             ))
         } finally {
             setLoading(false)
-            setTimeout(() => inputRef.current?.focus(), 100)
+            setTimeout(() => inputRef.current?.focus(), 80)
         }
     }
 
-    const handleKeyDown = (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault()
-            handleSend()
-        }
+    const onKey = e => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
     }
+
+    const autoGrow = e => {
+        const el = e.target
+        // Remove inline height first so scrollHeight is recalculated correctly
+        el.style.height = ''
+        if (el.value) {
+            // Only set explicit height when there IS content
+            el.style.height = Math.min(el.scrollHeight, 160) + 'px'
+        }
+        // When empty: leave style.height unset so CSS rows={1} controls it
+    }
+
+    const handleSuggestion = text => {
+        setInput(text)
+        setTimeout(() => inputRef.current?.focus(), 50)
+    }
+
+    const suggestions = [
+        'भूखंड ka size kya hai?',
+        'जमाराशि kitni hai?',
+        'Agency name kya hai?',
+        'Date of casting kya hai?',
+        'Tender amount kitna tha?',
+        'भूखंड 148 ki jankari do',
+    ]
+
+    const filterName = activeFilter ? activeFilter.split(/[/\\]/).pop() : null
 
     return (
-        <div className="app-container">
-            <Header ready={ready} darkMode={darkMode} onToggleDark={toggleDarkMode} />
+        <div className="app">
+            <TopBar ready={ready} dark={dark} onToggleDark={toggleDark} />
+
+            {/* Document filter bar */}
+            <FilterBar
+                docs={docList}
+                activeFilter={activeFilter}
+                onFilter={setActiveFilter}
+            />
+
+            {/* Active filter badge */}
+            {filterName && (
+                <div className="active-filter-badge">
+                    <FileText size={11} />
+                    Filtering: <strong>{filterName}</strong>
+                    <button onClick={() => setActiveFilter(null)} title="Clear filter">
+                        <X size={12} />
+                    </button>
+                </div>
+            )}
 
             <main className="chat-window">
                 {messages.map(msg => (
                     <MessageBubble
                         key={msg.id}
                         msg={msg}
-                        onPreview={(url, name) => setPreviewFile({ isOpen: true, url, name })}
+                        onPreview={(url, name) => setPreview({ open: true, url, name })}
                     />
                 ))}
                 <div ref={bottomRef} />
             </main>
 
             <div className="input-area">
-                <div className="input-container">
+                {/* Quick Suggestion Chips */}
+                {messages.length <= 1 && !input && (
+                    <div className="suggestions">
+                        {suggestions.map((s, i) => (
+                            <button
+                                key={i}
+                                className="suggestion-chip"
+                                onClick={() => handleSuggestion(s)}
+                                disabled={loading}
+                            >
+                                {s}
+                            </button>
+                        ))}
+                    </div>
+                )}
+                <div className="input-box">
                     <textarea
                         ref={inputRef}
-                        placeholder={isListening ? "Listening..." : "Search land records or ask a question..."}
-                        value={input}
-                        onChange={e => setInput(e.target.value)}
-                        onKeyDown={handleKeyDown}
                         rows={1}
+                        placeholder={listening
+                            ? '🎤 Listening...'
+                            : 'Ask anything… (Enter to send, Shift+Enter for new line)'}
+                        value={input}
+                        onChange={e => { setInput(e.target.value); autoGrow(e) }}
+                        onKeyDown={onKey}
                         disabled={loading}
                     />
                     <div className="input-actions">
                         <button
-                            className={`action-btn mic-btn ${isListening ? 'active' : ''}`}
+                            className={`btn-icon ${listening ? 'listening' : ''}`}
                             onClick={toggleListen}
                             disabled={loading}
-                            title="Voice Search"
+                            title="Voice input (Hindi)"
                         >
-                            {isListening ? <MicOff size={20} /> : <Mic size={20} />}
+                            {listening ? <MicOff size={17} /> : <Mic size={17} />}
                         </button>
                         <button
-                            className="send-btn"
+                            className="btn-send"
                             onClick={handleSend}
                             disabled={loading || !input.trim()}
+                            title="Send (Enter)"
                         >
-                            {loading ? <Loader2 className="animate-spin" size={20} /> : <Send size={20} />}
+                            {loading
+                                ? <Loader2 size={17} className="animate-spin" />
+                                : <Send size={17} />}
                         </button>
                     </div>
                 </div>
+                {input.length > 0 && (
+                    <div className="input-hint">Shift+Enter for new line · Enter to send</div>
+                )}
             </div>
 
             <PDFModal
-                isOpen={previewFile.isOpen}
-                fileUrl={previewFile.url}
-                fileName={previewFile.name}
-                onClose={() => setPreviewFile({ ...previewFile, isOpen: false })}
+                isOpen={preview.open}
+                fileUrl={preview.url}
+                fileName={preview.name}
+                onClose={() => setPreview(p => ({ ...p, open: false }))}
             />
         </div>
     )

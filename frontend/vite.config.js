@@ -10,7 +10,13 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, '')
-      }
+      },
+      '/status': { target: 'http://localhost:8000', changeOrigin: true },
+      '/chat': { target: 'http://localhost:8000', changeOrigin: true },
+      '/upload': { target: 'http://localhost:8000', changeOrigin: true },
+      '/scan': { target: 'http://localhost:8000', changeOrigin: true },
+      '/reset': { target: 'http://localhost:8000', changeOrigin: true },
+      '/docs': { target: 'http://localhost:8000', changeOrigin: true },
     }
   }
 })

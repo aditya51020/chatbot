@@ -11,19 +11,46 @@ from pdf_processor import load_all_pdfs, process_pdf, scan_pdf_root
 from rag import index_chunks, answer_query, get_indexed_docs, get_chunk_count, clear_collection, get_embedder
 
 
-# ── Startup: pre-load models + index existing PDFs ────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("\n🚀 Land Chatbot starting up...")
+def _warmup_phi3():
+    """Load Phi-3-mini into RAM in the background so first query is fast."""
+    try:
+        from gpt4all import GPT4All
+        from config import GPT4ALL_MODEL
+        import os
+        import rag as _rag
+        model_dir  = os.path.join(os.path.expanduser("~"), ".cache", "gpt4all")
+        model_path = os.path.join(model_dir, GPT4ALL_MODEL)
+        if os.path.exists(model_path) and _rag._phi3_model is None:
+            print("  🔄 Pre-loading Phi-3-mini into RAM...")
+            _rag._phi3_model = GPT4All(GPT4ALL_MODEL, model_path=model_dir, verbose=False)
+            print("  ✅ Phi-3-mini ready in RAM.")
+    except Exception as e:
+        print(f"  ⚠️  Phi-3-mini warmup skipped: {e}")
+
+
+# ── Startup: pre-load models + index existing PDFs (non-blocking) ─────────
+import threading
+
+def _background_init():
+    print("\n🚀 Land Chatbot initializing in background...")
     print("🔄 Pre-loading embedding model (this may take ~30s first time)...")
-    get_embedder()          # warm up NOW so uploads are instant later
+    get_embedder()          # warm up so uploads are instant later
     print("📂 Checking for existing PDFs to index...")
     chunks = load_all_pdfs()
     if chunks:
         index_chunks(chunks)
     else:
         print("   (No PDFs found – upload them from the UI)")
+    _warmup_phi3()          # load Phi-3-mini into RAM now so first query is instant
     print("✅ Ready!\n")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start heavy init in a background thread so Uvicorn binds to port 8000
+    # immediately — no more ECONNREFUSED while the model is loading.
+    t = threading.Thread(target=_background_init, daemon=True)
+    t.start()
     yield
 
 
@@ -54,6 +81,10 @@ app.add_middleware(
 # ── Models ─────────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     query: str
+    # Optional filters: restrict retrieval to a specific file or category.
+    # When None, all indexed documents are searched.
+    filename_filter: str | None = None
+    category_filter: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -141,7 +172,11 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty")
     
     def event_generator():
-        for chunk in answer_query(request.query):
+        for chunk in answer_query(
+            request.query,
+            filename_filter=request.filename_filter,
+            category_filter=request.category_filter,
+        ):
             # Yield as JSON strings separated by newlines (NDJSON style)
             yield json.dumps(chunk) + "\n"
 
