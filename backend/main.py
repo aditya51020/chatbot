@@ -4,41 +4,38 @@ import shutil
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from config import PDF_DIR, PDF_ROOT
+from config import PDF_DIR, PDF_ROOT, RERANK_ENABLED
 from pdf_processor import load_all_pdfs, process_pdf
-from rag import index_chunks, answer_query, get_indexed_docs, get_chunk_count, clear_collection, get_embedder
-
-
-def _warmup_phi3():
-    try:
-        from gpt4all import GPT4All
-        from config import GPT4ALL_MODEL
-        import rag as _rag
-        model_dir  = os.path.join(os.path.expanduser("~"), ".cache", "gpt4all")
-        model_path = os.path.join(model_dir, GPT4ALL_MODEL)
-        if os.path.exists(model_path) and _rag._phi3_model is None:
-            print("  Pre-loading Phi-3-mini into RAM...")
-            _rag._phi3_model = GPT4All(GPT4ALL_MODEL, model_path=model_dir, verbose=False)
-            print("  Phi-3-mini ready in RAM.")
-    except Exception as e:
-        print(f"  Phi-3-mini warmup skipped: {e}")
+from rag import (
+    index_chunks, answer_query, get_indexed_docs, get_chunk_count,
+    clear_collection, get_embedder, _build_bm25_index, _get_cross_encoder,
+)
+from database import init_db  # ensure DB + schema initialized on startup
 
 
 def _background_init():
     print("\nLand Chatbot starting up...")
-    get_embedder()
+    init_db()           # init PostgreSQL schema
+    get_embedder()      # warm embedding model
     chunks = load_all_pdfs()
     if chunks:
         index_chunks(chunks)
     else:
         print("  No PDFs found – upload them from the UI")
-    _warmup_phi3()
+
+    # Pre-build BM25 index so the first query has no cold-start delay
+    _build_bm25_index()
+
+    # Pre-load cross-encoder re-ranker model if enabled
+    if RERANK_ENABLED:
+        _get_cross_encoder()
+
     print("Ready!\n")
 
 
@@ -52,21 +49,34 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Land Info Chatbot API",
     description="Local RAG chatbot for land document queries",
-    version="1.0.0",
-    lifespan=lifespan
+    version="2.0.0",
+    lifespan=lifespan,
+    # Disable auto-generated docs in production if needed
+    # docs_url=None, redoc_url=None,
 )
 
 app.mount("/docs/samples", StaticFiles(directory=PDF_ROOT), name="samples")
 if os.path.exists(PDF_DIR):
     app.mount("/docs/uploads", StaticFiles(directory=PDF_DIR), name="uploads")
 
+# CORS — restrict in production; localhost only during dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "Accept"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response: Response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"]         = "DENY"
+    response.headers["X-XSS-Protection"]        = "1; mode=block"
+    response.headers["Referrer-Policy"]          = "no-referrer"
+    return response
 
 
 class ChatRequest(BaseModel):
@@ -83,7 +93,7 @@ class ChatResponse(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "running", "message": "Land Chatbot API"}
+    return {"status": "running", "message": "Land Chatbot API v2"}
 
 
 @app.get("/status")
@@ -98,23 +108,25 @@ def status():
         categories[cat].append(d)
     return {
         "indexed_documents": docs,
-        "total_chunks": count,
-        "categories": dict(categories),
-        "pdf_root": PDF_ROOT,
-        "ready": count > 0
+        "total_chunks":      count,
+        "categories":        dict(categories),
+        "pdf_root":          PDF_ROOT,
+        "ready":             count > 0,
     }
 
 
 @app.post("/scan")
 def rescan():
     clear_collection()
+    from database import clear_metadata
+    clear_metadata()
     chunks = load_all_pdfs()
     if not chunks:
         return {"message": "No PDFs found to index", "chunks_indexed": 0}
     indexed = index_chunks(chunks)
     return {
-        "message": f"Scanned and indexed {indexed} chunks from {PDF_ROOT}",
-        "chunks_indexed": indexed
+        "message":        f"Scanned and indexed {indexed} chunks from {PDF_ROOT}",
+        "chunks_indexed": indexed,
     }
 
 
@@ -128,12 +140,15 @@ async def upload_pdf(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, f)
     chunks = process_pdf(save_path)
     if not chunks:
-        raise HTTPException(status_code=422, detail="Could not extract text from PDF. Is it a searchable/OCR PDF?")
+        raise HTTPException(
+            status_code=422,
+            detail="Could not extract text from PDF. Is it a searchable/OCR PDF?"
+        )
     indexed = index_chunks(chunks)
     return {
-        "message": f"'{file.filename}' indexed successfully",
-        "filename": file.filename,
-        "chunks_indexed": indexed
+        "message":        f"'{file.filename}' indexed successfully",
+        "filename":       file.filename,
+        "chunks_indexed": indexed,
     }
 
 
@@ -156,4 +171,6 @@ async def chat(request: ChatRequest):
 @app.delete("/reset")
 def reset():
     clear_collection()
+    from database import clear_metadata
+    clear_metadata()
     return {"message": "All indexed documents cleared"}

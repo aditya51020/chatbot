@@ -5,7 +5,7 @@ import {
     Send, Bot, User, FileText, Search,
     Loader2, Moon, Sun, Mic, MicOff,
     Maximize2, X, ExternalLink, ChevronDown, ChevronUp,
-    Filter, FolderOpen
+    Filter, FolderOpen, Trash2, WifiOff
 } from 'lucide-react'
 import './App.css'
 
@@ -41,7 +41,7 @@ function PDFModal({ isOpen, fileUrl, fileName, onClose }) {
 }
 
 // ── Top Bar ──────────────────────────────────────────────────────────────
-function TopBar({ ready, dark, onToggleDark }) {
+function TopBar({ ready, dark, onToggleDark, onClearHistory, hasHistory }) {
     return (
         <header className="topbar">
             <div className="brand">
@@ -52,6 +52,11 @@ function TopBar({ ready, dark, onToggleDark }) {
                 </div>
             </div>
             <div className="topbar-right">
+                {hasHistory && (
+                    <button className="icon-btn" onClick={onClearHistory} title="Clear chat history">
+                        <Trash2 size={15} />
+                    </button>
+                )}
                 <button className="icon-btn" onClick={onToggleDark} title="Toggle theme">
                     {dark ? <Sun size={16} /> : <Moon size={16} />}
                 </button>
@@ -192,8 +197,10 @@ function MessageBubble({ msg, onPreview }) {
 
             <div className="bubble">
                 {msg.loading ? (
-                    <div className="typing">
-                        <span /><span /><span />
+                    <div className="skeleton">
+                        <div className="skeleton-line" style={{ width: '85%' }} />
+                        <div className="skeleton-line" style={{ width: '65%' }} />
+                        <div className="skeleton-line" style={{ width: '45%' }} />
                     </div>
                 ) : (
                     <>
@@ -257,21 +264,38 @@ function MessageBubble({ msg, onPreview }) {
     )
 }
 
-// ── App ──────────────────────────────────────────────────────────────────
-export default function App() {
-    const [messages, setMessages] = useState([{
-        id: 0,
-        role: 'bot',
-        content: `**Land Records Assistant**
+// ── Chat History Persistence ─────────────────────────────────────────────
+const STORAGE_KEY = 'land-chat-history'
+const MAX_STORED_MESSAGES = 50
+
+const WELCOME_MSG = {
+    id: 0,
+    role: 'bot',
+    content: `**Land Records Assistant**
 
 कुछ भी पूछें — Hindi, Hinglish, या English में। भूखंड, जमाराशि, agency name, tender amount, work order — सब मिलेगा।
 
 Filter bar से specific PDF चुन सकते हैं। Galat spelling भी चलेगी।`,
-        sources: [],
-        table: [],
-        sourcesDetail: [],
-        detail: null
-    }])
+    sources: [],
+    table: [],
+    sourcesDetail: [],
+    detail: null
+}
+
+function loadSavedMessages() {
+    try {
+        const raw = localStorage.getItem(STORAGE_KEY)
+        if (raw) {
+            const parsed = JSON.parse(raw)
+            if (Array.isArray(parsed) && parsed.length > 0) return parsed
+        }
+    } catch { /* corrupted storage */ }
+    return [WELCOME_MSG]
+}
+
+// ── App ──────────────────────────────────────────────────────────────────
+export default function App() {
+    const [messages, setMessages] = useState(loadSavedMessages)
     const [input, setInput] = useState('')
     const [loading, setLoading] = useState(false)
     const [ready, setReady] = useState(false)
@@ -280,6 +304,7 @@ Filter bar से specific PDF चुन सकते हैं। Galat spellin
     const [preview, setPreview] = useState({ open: false, url: '', name: '' })
     const [docList, setDocList] = useState([])
     const [activeFilter, setActiveFilter] = useState(null)
+    const [connectionError, setConnectionError] = useState(false)
 
     const bottomRef = useRef(null)
     const inputRef = useRef(null)
@@ -287,18 +312,39 @@ Filter bar से specific PDF चुन सकते हैं। Galat spellin
 
     useEffect(() => { document.body.classList.toggle('dark', dark) }, [dark])
 
+    // Persist messages to localStorage
+    useEffect(() => {
+        try {
+            const toSave = messages.slice(-MAX_STORED_MESSAGES).map(m => ({
+                ...m, loading: false // never persist loading state
+            }))
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave))
+        } catch { /* quota exceeded — fail silently */ }
+    }, [messages])
+
     const checkStatus = useCallback(async () => {
         try {
             const r = await fetch(`${API}/status`)
             const d = await r.json()
             setReady(d.ready)
+            setConnectionError(false)
             if (d.indexed_documents?.length) {
                 setDocList(d.indexed_documents)
             }
-        } catch { /* server not yet up */ }
+        } catch {
+            setConnectionError(true)
+        }
     }, [])
 
     useEffect(() => { checkStatus() }, [checkStatus])
+
+    // Auto-retry connection every 5 seconds when disconnected
+    useEffect(() => {
+        if (!connectionError) return
+        const interval = setInterval(checkStatus, 5000)
+        return () => clearInterval(interval)
+    }, [connectionError, checkStatus])
+
     useEffect(() => {
         bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
     }, [messages])
@@ -327,6 +373,14 @@ Filter bar से specific PDF चुन सकते हैं। Galat spellin
         setDark(next)
         localStorage.setItem('theme', next ? 'dark' : 'light')
     }
+
+    const clearHistory = () => {
+        setMessages([WELCOME_MSG])
+        localStorage.removeItem(STORAGE_KEY)
+    }
+
+    const hasHistory = messages.length > 1
+    const showSuggestions = messages.length <= 1
 
     const handleSend = async () => {
         const query = input.trim()
@@ -439,7 +493,21 @@ Filter bar से specific PDF चुन सकते हैं। Galat spellin
 
     return (
         <div className="app">
-            <TopBar ready={ready} dark={dark} onToggleDark={toggleDark} />
+            <TopBar
+                ready={ready}
+                dark={dark}
+                onToggleDark={toggleDark}
+                onClearHistory={clearHistory}
+                hasHistory={hasHistory}
+            />
+
+            {/* Connection error toast */}
+            {connectionError && (
+                <div className="connection-toast">
+                    <WifiOff size={14} />
+                    Server unreachable — retrying...
+                </div>
+            )}
 
             {/* Document filter bar */}
             <FilterBar
@@ -467,6 +535,21 @@ Filter bar से specific PDF चुन सकते हैं। Galat spellin
                         onPreview={(url, name) => setPreview({ open: true, url, name })}
                     />
                 ))}
+                {/* Suggestion chips — only on fresh chat */}
+                {showSuggestions && (
+                    <div className="suggestions">
+                        {suggestions.map((text, i) => (
+                            <button
+                                key={i}
+                                className="suggestion-chip"
+                                onClick={() => handleSuggestion(text)}
+                                disabled={loading}
+                            >
+                                {text}
+                            </button>
+                        ))}
+                    </div>
+                )}
                 <div ref={bottomRef} />
             </main>
 

@@ -1,12 +1,49 @@
 import os
 import re
 import fitz
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
 from config import PDF_ROOT, PDF_DIR, CHUNK_SIZE, CHUNK_OVERLAP
 
 
 def extract_pages_from_pdf(pdf_path: str) -> list[tuple[int, str]]:
-    doc = fitz.open(pdf_path)
     pages = []
+    
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(pdf_path) as pb_doc:
+                doc = fitz.open(pdf_path)
+                for i in range(len(doc)):
+                    page_text = doc[i].get_text("text")
+
+                    # Table extraction
+                    tables_text = []
+                    if i < len(pb_doc.pages):
+                        pb_page = pb_doc.pages[i]
+                        tables = pb_page.extract_tables()
+                        for table in tables:
+                            for row in table:
+                                clean_row = [str(c).replace('\n', ' ').strip() if c else "" for c in row]
+                                if any(clean_row):
+                                    tables_text.append(" | ".join(clean_row))
+
+                    if tables_text:
+                        merged = page_text + "\n\n[Extracted Tables]\n" + "\n".join(tables_text)
+                    else:
+                        merged = page_text
+                    
+                    if merged.strip():
+                        pages.append((i + 1, merged))
+                        
+                doc.close()
+            return pages
+        except Exception as e:
+            print(f"  [pdfplumber] Failed to extract tables: {e}, falling back to text-only")
+
+    # Fallback / No pdfplumber
+    doc = fitz.open(pdf_path)
     for i, page in enumerate(doc):
         text = page.get_text("text")
         if text.strip():
@@ -43,25 +80,42 @@ def _is_heading(line: str) -> bool:
     return any(re.match(p, line) for p in patterns)
 
 
-def _semantic_split(page_text: str, chunk_size: int, overlap: int) -> list[str]:
+def _section_based_split(page_text: str, chunk_size: int, overlap: int) -> list[str]:
+    """
+    Gov/Tender specific section-based chunking.
+    Prioritizes splitting on major document sections rather than arbitrary lengths.
+    """
+    section_patterns = [
+        r'(?i)^(?:notice\s+inviting\s+tender|nit)\b',
+        r'(?i)^eligibility(\s+criteria)?\b',
+        r'(?i)^(details\s+of\s+)?bidder(s)?\b',
+        r'(?i)^financial\s+bid\b',
+        r'(?i)^technical\s+bid\b',
+        r'(?i)^terms\s+(and|&)\s+conditions\b',
+        r'(?i)^schedule\s+[a-z]\b',
+    ]
     lines = page_text.split('\n')
     segments = []
     current = []
 
     for line in lines:
-        if _is_heading(line) and current:
-            seg = '\n'.join(current).strip()
-            if seg:
-                segments.append(seg)
+        clean_line = line.strip()
+        is_major_section = any(re.match(p, clean_line) for p in section_patterns)
+        
+        if is_major_section and current:
+            segments.append('\n'.join(current).strip())
+            current = [line]
+        elif _is_heading(line) and current and sum(len(x) for x in current) > chunk_size:
+            # Fallback sub-heading split if a section gets too large
+            segments.append('\n'.join(current).strip())
             current = [line]
         else:
             current.append(line)
 
     if current:
-        seg = '\n'.join(current).strip()
-        if seg:
-            segments.append(seg)
+        segments.append('\n'.join(current).strip())
 
+    # Further enforce chunk size limit using rolling window if still too long
     chunks = []
     for seg in segments:
         words = seg.split()
@@ -72,11 +126,9 @@ def _semantic_split(page_text: str, chunk_size: int, overlap: int) -> list[str]:
             while start < len(words):
                 end = min(start + chunk_size, len(words))
                 chunks.append(' '.join(words[start:end]))
-                if end == len(words):
-                    break
                 start += chunk_size - overlap
 
-    return chunks if chunks else [page_text.strip()]
+    return [c for c in chunks if c.strip()]
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
@@ -87,7 +139,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         block = block.strip()
         if not block:
             continue
-        for sub in _semantic_split(block, chunk_size, overlap):
+        for sub in _section_based_split(block, chunk_size, overlap):
             chunks.append((header.strip() + "\n" + sub).strip() if header.strip() else sub)
     if not chunks:
         words = text.split()
@@ -135,12 +187,12 @@ def process_pdf(pdf_path: str, root: str = None) -> list[dict]:
         page_text = page_text.strip()
         if not page_text:
             continue
-        for sub in _semantic_split(page_text, CHUNK_SIZE, CHUNK_OVERLAP):
+        for sub in _section_based_split(page_text, CHUNK_SIZE, CHUNK_OVERLAP):
             if not sub.strip():
                 continue
             result.append({
                 "text":        f"{header}\n[Page {page_num}]\n{sub}",
-                "filename":    f"{meta['category']}/{meta['case_number']}/{meta['doc_type']}/{meta['filename']}",
+                "filename":    meta["rel_path"].replace("\\", "/"),
                 "category":    meta["category"],
                 "case_number": meta["case_number"],
                 "doc_type":    meta["doc_type"],

@@ -1,0 +1,24 @@
+{
+  "sequential": {
+    "total": 100,
+    "errors": 0,
+    "min_ms": 2119,
+    "max_ms": 6704,
+    "avg_ms": 2434,
+    "p50_ms": 2299,
+    "p95_ms": 2970,
+    "p99_ms": 6704
+  },
+  "concurrent": {
+    "users": 20,
+    "total": 100,
+    "errors": 0,
+    "wall_ms": 32108,
+    "throughput_qps": 3.11,
+    "avg_ms": 5723,
+    "p50_ms": 5294,
+    "p95_ms": 9253,
+    "p99_ms": 10141
+  },
+  "timestamp": "2026-03-05T21:27:07"
+}
