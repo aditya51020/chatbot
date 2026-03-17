@@ -7,16 +7,16 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, '')
       },
-      '/status': { target: 'http://localhost:8000', changeOrigin: true },
-      '/chat': { target: 'http://localhost:8000', changeOrigin: true },
-      '/upload': { target: 'http://localhost:8000', changeOrigin: true },
-      '/scan': { target: 'http://localhost:8000', changeOrigin: true },
-      '/reset': { target: 'http://localhost:8000', changeOrigin: true },
-      '/docs': { target: 'http://localhost:8000', changeOrigin: true },
+      '/status': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/chat': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/upload': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/scan': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/reset': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/docs': { target: 'http://127.0.0.1:8000', changeOrigin: true },
     }
   }
 })

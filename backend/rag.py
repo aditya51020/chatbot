@@ -9,25 +9,56 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from config import (
     CHROMA_DIR, EMBED_MODEL,
     TOP_K, COLLECTION_NAME, RERANK_TOP_N, RERANK_MODEL,
-    LLM_ENABLED, RERANK_ENABLED,
+    LLM_ENABLED, RERANK_ENABLED, OFFLINE_MODE,
 )
 
 # singletons — loaded once, reused for every query
 _embedder: Optional[SentenceTransformer] = None
 _chroma_client = None
 _collection = None
-_phi3_model = None
+_llm_model = None
 _cross_encoder = None
 _bm25_index = None
 _bm25_corpus = None
 
 
-def get_embedder() -> SentenceTransformer:
+def clean_for_llm(text: str) -> str:
+    """
+    Remove PDF extraction garbage before text is sent to the LLM.
+    Keeps: Devanagari, Latin letters, digits, common punctuation, currency symbols.
+    Strips: stray unicode blocks, control chars, excessive punctuation noise.
+    """
+    # Keep Devanagari (\u0900-\u097F), Latin (a-zA-Z), digits, spaces,
+    # common punctuation, and currency symbols
+    text = re.sub(r'[^\u0900-\u097F\u0966-\u096Fa-zA-Z0-9\s₹.,;:/()\'"\-–\n]', ' ', text)
+    # Collapse runs of spaces (but keep newlines for structure)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    # Remove lines that are nothing but punctuation/spaces
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if len(re.sub(r'[\W\d]', '', ln)) > 1]
+    return '\n'.join(lines).strip()
+
+
+def get_embedder() -> Optional[SentenceTransformer]:
     global _embedder
     if _embedder is None:
-        print("Loading embedding model...")
-        _embedder = SentenceTransformer(EMBED_MODEL)
-        print("Embedding model loaded.")
+        print(f"[EMBEDDER] Loading model: {EMBED_MODEL}, OFFLINE_MODE={OFFLINE_MODE}")
+        try:
+            # When offline mode is enabled, the HuggingFace/transformers libs will
+            # refuse network access and only load from the local cache.
+            _embedder = SentenceTransformer(
+                EMBED_MODEL,
+                device="cpu",
+                local_files_only=OFFLINE_MODE,
+            )
+            dim = _embedder.get_sentence_embedding_dimension()
+            print(f"[EMBEDDER] Successfully loaded: {EMBED_MODEL}")
+            print(f"[EMBEDDER] Embedding dimension: {dim}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load embedding model: {e}")
+            print("        * If you have no internet, set OFFLINE_MODE=1 and ensure the model is cached locally.")
+            print("        * If you do have internet, verify connectivity or choose a smaller locally installed model.")
+            _embedder = None
     return _embedder
 
 
@@ -56,31 +87,54 @@ def get_collection():
                 raise
     return _collection
 
-
-def index_chunks(chunks: list[dict]) -> int:
+def index_chunks(chunks: list[dict]):
     if not chunks:
+        print("!!! No chunks found to index !!!")
         return 0
+    
     collection = get_collection()
-    embedder   = get_embedder()
-    texts      = [c["text"] for c in chunks]
-    metadatas  = [{
-        "filename":    c.get("filename", "unknown"),
-        "chunk_index": c.get("chunk_index", 0),
-        "category":    c.get("category", ""),
-        "case_number": c.get("case_number", ""),
-        "doc_type":    c.get("doc_type", ""),
-    } for c in chunks]
+    embedder = get_embedder()
+
+    if embedder is None:
+        print("[ERROR] Cannot index chunks because embedding model isn't available.")
+        print("        Ensure you have internet access or set OFFLINE_MODE=1 with a cached model.")
+        return 0
+
     ids = [str(uuid.uuid4()) for _ in chunks]
-    print(f"  Generating embeddings for {len(texts)} chunks...")
-    embeddings = embedder.encode(texts, show_progress_bar=True).tolist()
-    collection.add(documents=texts, embeddings=embeddings, metadatas=metadatas, ids=ids)
-    print(f"  Indexed {len(texts)} chunks into Chroma.")
-    _invalidate_bm25()
 
-    # --- Also extract structured metadata into SQLite ---
-    _index_metadata_sqlite(chunks)
+    # FIX: Change 'text' to 'content' to match pdf_processor.py
+    texts = [c["content"] for c in chunks]
 
-    return len(texts)
+    metadatas = [c.get("metadata", {}) for c in chunks]
+
+    print(f"[INDEX] Encoding {len(texts)} chunks with embedding model...")
+    # normalize_embeddings=True is REQUIRED for bge-m3 — without it cosine scores
+    # collapse to ~0.05 instead of the expected 0.7–0.95 range
+    embeddings = embedder.encode(
+        texts,
+        batch_size=16,
+        show_progress_bar=True,
+        normalize_embeddings=True,   # ← critical for correct cosine similarity
+    ).tolist()
+    print(f"[INDEX] Generated {len(embeddings)} embeddings")
+    print(f"[INDEX] Sample embedding dimension: {len(embeddings[0])}")
+
+    print(f"[INDEX] Storing {len(ids)} chunks in ChromaDB (batched)...")
+    BATCH_SIZE = 200
+    total_added = 0
+    for i in range(0, len(ids), BATCH_SIZE):
+        batch_end = min(i + BATCH_SIZE, len(ids))
+        collection.add(
+            ids=ids[i:batch_end],
+            embeddings=embeddings[i:batch_end],
+            documents=texts[i:batch_end],
+            metadatas=metadatas[i:batch_end],
+        )
+        total_added += batch_end - i
+        print(f"[INDEX]   Stored batch {i // BATCH_SIZE + 1}: {total_added}/{len(ids)} chunks")
+    print(f"[INDEX] Successfully indexed {total_added} chunks")
+    print(f"ChromaDB: Successfully saved {total_added} chunks.")
+    return total_added
 
 
 def _index_metadata_sqlite(chunks: list[dict]) -> None:
@@ -191,6 +245,12 @@ def clean_ocr_text_scored(text: str) -> tuple[str, float]:
     text = re.sub(r'\[Case:[^\]]+\]\s*',     '', text)
     text = re.sub(r'\[Type:[^\]]+\]\s*',     '', text)
     text = re.sub(r'\[Page \d+\]\n?',        '', text)
+    
+    # Aggressively clean OCR garbage out to improve embedding search space
+    text = re.sub(r'[^\u0900-\u097F0-9A-Za-z₹.,:\-\n]', ' ', text)
+    # Collapse runaway spaces, but preserve newlines
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+
     lines = text.split('\n')
     clean = []
     total = 0
@@ -270,7 +330,11 @@ def _query_chroma(
     category_filter: str | None = None,
 ) -> list[dict]:
     """Encode a single query and search Chroma (legacy helper)."""
-    emb = get_embedder().encode([query_text])[0].tolist()
+    embedder = get_embedder()
+    if embedder is None:
+        print("[WARN] _query_chroma called but no embedding model is available.")
+        return []
+    emb = embedder.encode([query_text])[0].tolist()
     return _query_chroma_emb(emb, n, filename_filter, category_filter)
 
 
@@ -384,8 +448,11 @@ def _build_bm25_index():
 
     corpus = []
     for doc, meta in zip(docs, metas):
+        # Defensive strip: remove any residual metadata tokens from old index entries
+        # clean_ocr_text() strips [Source:...], [Category:...], [Page N] patterns
+        clean_doc, _ = clean_ocr_text_scored(doc)
         corpus.append({
-            "text":     doc,
+            "text":     clean_doc if clean_doc else doc,  # fallback to raw if cleaning empties it
             "filename": meta.get("filename", "unknown"),
             "category": meta.get("category", ""),
             "case":     meta.get("case_number", ""),
@@ -396,6 +463,11 @@ def _build_bm25_index():
     _bm25_index = BM25Okapi(tokenized)
     _bm25_corpus = corpus
     print(f"  BM25 index built: {len(corpus)} chunks.")
+
+    # Diagnostic: print the first chunk to confirm index is clean
+    if corpus:
+        preview = corpus[0]["text"][:200].replace("\n", " ")
+        print(f"  [BM25 SANITY] First chunk preview: {preview}...")
 
 
 def _invalidate_bm25():
@@ -411,6 +483,27 @@ def _extract_person_names(query: str) -> list[str]:
     words = re.findall(r'[A-Za-z\u0900-\u097F]{4,}', query)
     return [w.lower() for w in words if w.lower() not in skip]
 
+def extract_structured_data_from_chunks(chunks: list[dict], filename: str) -> dict:
+    """
+    Analyzes OCR text chunks to populate PostgreSQL columns.
+    Matches Requirement 5 (Area) and Requirement 2 (Loan).
+    """
+    full_text = " ".join([c['text'] for c in chunks])
+    
+    # Simple regex/keyword logic to find data in the Hindi/English mix
+    data = {
+        "filename": filename,
+        "plot_number": extract_plot_number_from_query(full_text), # reuse your existing helper
+        "has_active_loan": "Yes" if any(x in full_text for x in ["ऋण", "loan", "bank"]) else "No",
+        "has_stay_order": "Yes" if "स्टे" in full_text or "stay" in full_text.lower() else "No",
+    }
+    
+    # Logic for Requirement 5 (Hectare/Area)
+    area_match = re.search(r"(\d+\.\d+)\s*(hectare|हेक्टेयर|वर्गगज)", full_text)
+    if area_match:
+        data["land_area_recorded"] = float(area_match.group(1))
+        
+    return data
 
 def retrieve_context(
     query: str,
@@ -421,23 +514,43 @@ def retrieve_context(
     intents = detect_intent(query)
     queries = [query] + [f"{intent} {query}" for intent in intents]
 
-    # --- batch encode ALL query variants in ONE call ---
-    embedder = get_embedder()
-    all_embeddings = embedder.encode(queries, batch_size=len(queries), show_progress_bar=False)
-
-    # vector retrieval — one Chroma call per variant, no extra encode() calls
-    seen_vector: set = set()
+    # --- vector retrieval (optional, requires embedding model) ---
     vector_chunks: list[dict] = []
-    for emb in all_embeddings:
-        for chunk in _query_chroma_emb(emb.tolist(), TOP_K, filename_filter=filename_filter, category_filter=category_filter):
-            key = (chunk["filename"], chunk["text"][:60])
-            if key not in seen_vector:
-                seen_vector.add(key)
-                boost  = _work_name_boost(chunk["text"], query)
-                boost += _plot_id_boost(chunk["text"], query)
-                chunk["score"] = min(1.0, chunk["score"] + boost)
-                vector_chunks.append(chunk)
-    vector_chunks.sort(key=lambda c: c["score"], reverse=True)
+    embedder = get_embedder()
+    if embedder is not None:
+        print(f"[VECTOR] Starting vector search with {len(queries)} query variants")
+        try:
+            all_embeddings = embedder.encode(
+                queries,
+                batch_size=len(queries),
+                show_progress_bar=False,
+                normalize_embeddings=True,   # ← must match how index embeddings were built
+            )
+
+            # vector retrieval — one Chroma call per variant, no extra encode() calls
+            seen_vector: set = set()
+            for idx, emb in enumerate(all_embeddings):
+                results = _query_chroma_emb(emb.tolist(), TOP_K, filename_filter=filename_filter, category_filter=category_filter)
+                for chunk in results:
+                    key = (chunk["filename"], chunk["text"][:60])
+                    if key not in seen_vector:
+                        seen_vector.add(key)
+                        boost  = _work_name_boost(chunk["text"], query)
+                        boost += _plot_id_boost(chunk["text"], query)
+                        chunk["score"] = min(1.0, chunk["score"] + boost)
+                        vector_chunks.append(chunk)
+            vector_chunks.sort(key=lambda c: c["score"], reverse=True)
+            # ── capture raw cosine top score NOW, before RRF loop overwrites chunk["score"]
+            _raw_vector_top_score = vector_chunks[0]["score"] if vector_chunks else 0.0
+            print(f"[VECTOR] Retrieved {len(vector_chunks)} chunks from vector search")
+            if vector_chunks:
+                print(f"[VECTOR] Top score: {_raw_vector_top_score:.3f}")
+        except Exception as e:
+            print(f"[WARN] Embedding model failed during query encoding: {e}")
+            print("       Falling back to BM25-only retrieval.")
+    else:
+        print("[WARN] No embedding model available — using BM25-only retrieval.")
+    _raw_vector_top_score: float = vector_chunks[0]["score"] if vector_chunks else 0.0
 
     # BM25 retrieval with synonym expansion
     bm25_chunks: list[dict] = []
@@ -454,40 +567,40 @@ def retrieve_context(
                     c["bm25_score"] = float(scores[idx])
                     bm25_chunks.append(c)
 
-    # Dynamic Weigting based on Intent
-    is_numeric_intent = any(i in [
-        "W.O. Number", "Ref. Number", "Plot Number", "Deposit Amount", 
-        "Tender Amount", "FD Account No", "Schedule Discount", 
-        "Date of Casting", "Date of Testing", "Maturity Date"
-    ] for i in intents)
+    # RRF (Reciprocal Rank Fusion)
+    # Rank-based fusion: immune to score distribution shifts
+    # Uses only rank position, not score magnitude
+    K = 60  # Standard RRF constant
     
-    # Keyword-heavy queries need more BM25 dominance. Semantic needs more Vector.
-    vector_weight = 0.3 if is_numeric_intent else 0.7
-    bm25_weight   = 0.7 if is_numeric_intent else 0.3
-
-    # Reciprocal Rank Fusion (k=60)
     rrf_scores: dict[tuple, float] = {}
     chunk_map:  dict[tuple, dict]  = {}
-    K = 60
 
-    for rank, c in enumerate(vector_chunks):
+    # Add vector results by rank (rank position, not score value)
+    for rank, c in enumerate(vector_chunks, 1):
         key = (c["filename"], c["text"][:80])
-        score = 1.0 / (K + rank + 1)
-        rrf_scores[key] = rrf_scores.get(key, 0.0) + (score * vector_weight)
+        score = 1.0 / (K + rank)
+        rrf_scores[key] = rrf_scores.get(key, 0.0) + score
         chunk_map[key] = c
 
-    for rank, c in enumerate(bm25_chunks):
+    # Add BM25 results by rank
+    for rank, c in enumerate(bm25_chunks, 1):
         key = (c["filename"], c["text"][:80])
-        score = 1.0 / (K + rank + 1)
-        rrf_scores[key] = rrf_scores.get(key, 0.0) + (score * bm25_weight)
+        score = 1.0 / (K + rank)
+        rrf_scores[key] = rrf_scores.get(key, 0.0) + score
         if key not in chunk_map:
             chunk_map[key] = c
 
+    # Sort by combined RRF scores
     fused = sorted(
         chunk_map.values(),
         key=lambda c: rrf_scores.get((c["filename"], c["text"][:80]), 0),
         reverse=True
     )[:TOP_K]
+    
+    # Attach RRF fusion scores to chunks for display
+    for chunk in fused:
+        key = (chunk["filename"], chunk["text"][:80])
+        chunk["score"] = rrf_scores.get(key, 0)
 
     # person-name filter — avoid pulling unrelated records when a name is in the query
     person_words = _extract_person_names(query)
@@ -497,7 +610,35 @@ def retrieve_context(
             print(f"  [name-filter] kept {len(filtered)}/{len(fused)} chunks")
             fused = filtered
 
-    return fused
+    # ── Retrieval diagnostics ─────────────────────────────────────────────
+    # IMPORTANT: _raw_vector_top_score is captured BEFORE the RRF loop below
+    # mutates chunk["score"] in-place. Reading vector_chunks[0]["score"] here
+    # would give the RRF score (~0.046), not the cosine similarity (~0.930).
+    vector_hits    = len(vector_chunks)
+    raw_vector_top = _raw_vector_top_score                 # cosine sim 0–1
+    rrf_top        = fused[0]["score"] if fused else 0.0   # RRF score max ~0.033
+    print(f"\n  [retrieval] vector_hits={vector_hits} raw_vector_top={raw_vector_top:.3f} "
+          f"rrf_top={rrf_top:.4f} total_fused={len(fused)}")
+    for i, chunk in enumerate(fused[:3]):
+        rrf_s   = chunk.get("score", 0)
+        preview = chunk["text"][:120].replace("\n", " ")
+        fname   = chunk.get("filename", "unknown").split("/")[-1]
+        print(f"    Chunk {i+1} (rrf={rrf_s:.4f}, file={fname}): {preview}...")
+
+    # ── Quality filter using RAW VECTOR score (not RRF) ──────────────────
+    # RRF scores are inherently tiny (1/(60+rank) ≈ 0.016 for rank 1).
+    # Comparing 0.049 against 0.15 will always fail. Use cosine similarity instead.
+    # 0.50 = "at least somewhat semantically related"
+    # 3 chunks minimum to give LLM enough context
+    MIN_VECTOR_SCORE = 0.50
+    MIN_CHUNK_COUNT  = 3
+    if raw_vector_top < MIN_VECTOR_SCORE or len(fused) < MIN_CHUNK_COUNT:
+        print(f"  [retrieval] LOW CONFIDENCE — raw_vector_top={raw_vector_top:.3f} "
+              f"chunks={len(fused)} → returning empty")
+        return []   # caller returns 'जानकारी उपलब्ध नहीं है'
+
+    # Return top 6 to LLM
+    return fused[:6]
 
 
 # ---------------------------------------------------------------------------
@@ -545,10 +686,12 @@ def extract_key_info(text: str) -> dict:
         "Date of Testing":   r"(?i)Date\s*of\s*Testing\s*[:\-=]+\s*([\d.\-/]{6,12})",
         "W.O. Number":       r"(?i)W\.?O\.?\s*No\.?\s*[:\-/=]+\s*([\d\-/]{3,20})",
         "Ref. Number":       r"(?i)(?:Ref\.?\s*No\.?|NIT|Bid\s*No\.?)\s*[:\-=]*\s*([\w][\w\s\-/.]{2,30})",
-        "Plot Number":       r"(?i)(?:भूखंड|भूखण्ड|bhu\s*khand|plot)\s*(?:sankhya|संख्या|no\.?|number|क्रमांक)?\s*[:\-=]*\s*([0-9A-Za-z][0-9A-Za-z\-/]{0,5})(?=[\s,।]|$)",
-        "Plot Size":         r"(?i)(?:क्षेत्रफल|kshetrafal|area|आकार|akar|size|माप|maap|भूमि)\s*[:\-=\-–]*\s*([\d.,]+(?:\s*(?:sqm|sq\.?\s*m|वर्ग\s*मीटर|gaj|गज|sq\.?\s*ft|sq\.?\s*yard|वर्ग\s*गज))?)",
-        "Deposit Amount":    r"(?i)(?:जमाराशि|jama\s*rashi|deposit\s*amount|रकम|राशि|शुल्क)\s*[:\-=]*\s*(?:Rs\.?|₹|INR)?\s*([\d,]+(?:\.\d+)?)",
-        "Scheme Name":       r"(?i)(?:योजना|yojana|scheme)\s*(?:का\s*नाम|name)?\s*[:\-=]*\s*(.{3,60})",
+        "Plot Number":       r"(?i)(?:भूखंड|भूखण्ड|bhu\s*khand|plot|पट्टी)\s*(?:sankhya|संख्या|no\.?|number|क्रमांक)?\s*[:\-.=]*\s*([0-9A-Za-z][0-9A-Za-z\-/]{0,8}?)(?=[\s,।/\n]|$)",
+        "Plot Size":         r"(?i)(?:क्षेत्रफल|kshetrafal|area|आकार|akar|size|माप|maap|साईज)\s*(?:का\s*)?[:\-=\/.]*\s*([0-9.,]+)(?:\s*(?:sqm|sq\.?\s*m|वर्ग\s*मीटर|वर्ग|gaj|गज|sq\.?\s*ft|sq\.?\s*yard|bigha|बिघा|acre|एकड़))?",
+        "Deposit Amount":    r"(?i)(?:अमानत\s*राशि|वाणिज्यिक|जमाराशि|jama\s*rashi|deposit\s*amount|रकम|राशि|शुल्क)\s*[:\-=]*\s*(?:Rs\.?|₹|INR|रु\.?|रू\.?)?\s*([\d,]+(?:\.\d+)?)",
+        "Scheme Name":       r"(?i)(?:योजना|yojana|scheme)\s*(?:का\s*नाम|name)?\s*[:\-.=]*\s*([^,\n\|]{2,60}?)(?=\n|,|\||\d|$)",
+        "Second Party":      r"(?i)(?:दूसरा\s*पक्ष|second\s*party|party\s*2|दूसरा|पक्ष)[\s:.\-=]*([A-Za-z\s\u0900-\u097F]{2,60}?)(?=\n|,|$)",
+        "Owner":             r"(?i)(?:मालिक|malik|owner|धारक|darak|पट्टेदार|pattadar|स्वामी|malik|malik)\s*[:\-.=]*\s*([A-Za-z\s\u0900-\u097F]{2,60}?)(?=\n|,|$)",
         "Allottee Name":     r"(?i)(?:पट्टेदार|allottee|आवंती|pattadaar|पट्टाधारी)\s*[:\-=]*\s*(.{3,60})",
         "Tender Amount":     r"(?i)(?:contract\s*price|bid\s*amount|tender\s*amount|L1\s*amount|amount\s*rs\.?|quoted\s*rate\s*in\s*figures)\s*[:\-=]*\s*(?:Rs\.?|₹|INR)?\s*([\d,]+(?:\.\d+)?)",
         "Schedule Discount": r"(?i)(?:([\d.]+\s*%\s*Below\s*Schedule[^\n]{0,20})|Less\s*\(-\)\s*([\d.]+\s*%?))",
@@ -805,6 +948,33 @@ def keyword_scan(text: str) -> dict:
         if fd:
             found["FD Account No"] = fd.group(1)
 
+    # Additional extraction for land record specific fields
+    if "Second Party" not in found:
+        sp = re.search(
+            r"(?i)(?:दूसरा\s*पक्ष|second\s*party|party\s*2)[\s:.\-=]*([A-Za-z\s\u0900-\u097F]{2,60}?)(?=\n|,|$)",
+            text, re.IGNORECASE)
+        if sp:
+            val = sp.group(1).strip()
+            if len(val) >= 2 and len([w for w in val.split() if w]):
+                found["Second Party"] = val[:60]
+
+    if "Owner" not in found:
+        owner = re.search(
+            r"(?i)(?:मालिक|malik|owner|स्वामी|swami)[\s:.\-=]*([A-Za-z\s\u0900-\u097F]{2,60}?)(?=\n|,|$)",
+            text, re.IGNORECASE)
+        if owner:
+            val = owner.group(1).strip()
+            if len(val) >= 2:
+                found["Owner"] = val[:60]
+
+    if "Plot Size" not in found:
+        # Improved plot size extraction handling units better
+        m_size = re.search(
+            r'(?i)([\d.,]+)\s*(?:वर्ग\s*)?(?:sqm|sq\.?\s*m|मीटर|gaj|गज|sq\.?\s*ft|sq\.?\s*yard|bigha|बिघा|सेंट|cent)',
+            text)
+        if m_size:
+            found["Plot Size"] = m_size.group(1)
+
     return found
 
 
@@ -840,15 +1010,84 @@ _HINDI_CORRECTIONS = [
 ]
 
 
+# Hinglish → Hindi token mapping for query normalization
+_HINGLISH_MAP = [
+    # Filler words to remove
+    (r'\bkitni\s+hai\b',   ''),
+    (r'\bkya\s+hai\b',     ''),
+    (r'\bkitna\s+hai\b',   ''),
+    (r'\bkitne\s+hai\b',   ''),
+    (r'\bplease\b',        ''),
+    (r'\bbatao\b',         ''),
+    (r'\bbata\s+do\b',     ''),
+    # Hinglish → Hindi
+    (r'\bki\b',            'की'),
+    (r'\bka\b',            'का'),
+    (r'\bke\b',            'के'),
+    (r'\bhai\b',           'है'),
+    (r'\bkitni\b',         'कितनी'),
+    (r'\bkitna\b',         'कितना'),
+    (r'\bkya\b',           'क्या'),
+    (r'\bmein\b',          'में'),
+    (r'\byojana\b',        'योजना'),
+    (r'\byojna\b',         'योजना'),
+    (r'\bnilami\b',        'नीलामी'),
+    (r'\bamanat\b',        'अमानत'),
+    (r'\brashi\b',         'राशि'),
+    (r'\bbhukhand\b',      'भूखंड'),
+    (r'\bbhukand\b',       'भूखंड'),
+    (r'\baawaasiya\b',     'आवासीय'),
+]
+
+
 def normalize_query(query: str) -> tuple[str, str]:
+    """
+    1. Apply Hindi spelling corrections.
+    2. Convert Hinglish tokens to Hindi.
+    3. Strip filler words (kitni hai, kya hai, please...).
+    Returns (normalized_query, user_note).
+    """
     note = ''
+    # Step 1: spelling corrections
     for pattern, replacement, user_note in _HINDI_CORRECTIONS:
         new_q, n = re.subn(pattern, replacement, query)
         if n > 0:
             query = new_q
             if user_note and not note:
                 note = user_note
+    # Step 2: Hinglish → Hindi + filler strip
+    for pattern, replacement in _HINGLISH_MAP:
+        query = re.sub(pattern, replacement, query, flags=re.IGNORECASE)
+    # Collapse extra whitespace
+    query = re.sub(r'\s+', ' ', query).strip()
     return query, note
+
+
+def generate_query_variants(query: str) -> list[str]:
+    """
+    Generate up to 4 search query variants from the normalized query.
+    Used to improve multi-perspective retrieval coverage.
+    """
+    variants = [query]
+
+    # Keyword-only variant (extract important words)
+    keywords = re.findall(
+        r'[\u0900-\u097F][\u0900-\u097F\s]{3,}[\u0900-\u097F]|\b\w{5,}\b',
+        query
+    )
+    if keywords:
+        variants.append(' '.join(keywords[:6]))
+
+    # English-only variant
+    en_only = re.sub(r'[\u0900-\u097F]', '', query).strip()
+    if en_only and en_only != query:
+        variants.append(en_only)
+
+    # Amount-focused reformulation for deposit/money queries
+    if any(w in query for w in ['राशि', 'अमानत', 'deposit', 'रकम', 'amount']):
+        variants.append(f"अमानत राशि नीलामी योजना")
+
+    return list(dict.fromkeys(v.strip() for v in variants if v.strip()))[:4]
 
 
 def extract_plot_number_from_query(query: str) -> str | None:
@@ -907,7 +1146,7 @@ def detect_intent(query: str) -> list[str]:
         intents.append("Plot Number")
     if re.search(r'size|akar|आकार|area|maap|माप|varg|वर्ग|sqm|sq|gaj|गज|kshetrafal|क्षेत्रफल|saiz|साइज', q):
         intents.append("Plot Size")
-    if re.search(r'jama|जमा|rashi|राशि|deposit|amount|rakam|रकम|shulk|शुल्क|kitni', q):
+    if re.search(r'jama|जमा|rashi|राशि|deposit|amount|rakam|रकम|shulk|शुल्क|kitni|amanat|अमानत|biana|बयाना', q):
         intents.append("Deposit Amount")
     if re.search(r'yojana|योजना|scheme|nagar|tilak|colony|kalani|कालोनी', q):
         intents.append("Scheme Name")
@@ -987,7 +1226,7 @@ def build_natural_answer(
 
     _FIELD_LABELS = {
         "Agency Name":       "🏗️ **Contractor / Agency**",
-        "Date of Casting":   "📅 **Casting Date** (jab concrete dali gayi)",
+        "Date of Casting":   "📅 **Casting Date**",
         "Date of Testing":   "📈 **Testing Date**",
         "W.O. Number":       "📄 **Work Order No.**",
         "Ref. Number":       "🔗 **Reference No.**",
@@ -1040,9 +1279,8 @@ def build_natural_answer(
                 "> ⚠️ Yeh fields is document mein nahi mili: " +
                 ", ".join(f"_{f}_" for f in missing))
     elif not real_intents:
-        # Prevent confident hallucination on unknown queries by NOT dumping random Regex matches
         paragraphs.append(
-            "> ⚠️ Answer not found in document. (Direct extraction failed because the query intent was not recognized)."
+            "> ⚠️ Answer not found in document. (Query intent not recognized)."
         )
     else:
         paragraphs.append(
@@ -1057,9 +1295,8 @@ def build_natural_answer(
 # ---------------------------------------------------------------------------
 
 def _rewrite_query(query: str, intent: str) -> str:
-    """Agentic step to rewrite user chat into an optimized RAG search query."""
+    """Rewrite user chat into an optimized RAG search query."""
     if intent == "list_bidders":
-        # Extract the core project description from the query
         clean = re.sub(r'(?i)sare\s*bidder|ka\s*naam\s*do|batao|list|kaun|participation', '', query)
         clean = re.sub(r'[^a-zA-Z0-9\s]', '', clean).strip()
         if clean:
@@ -1067,57 +1304,55 @@ def _rewrite_query(query: str, intent: str) -> str:
         return "List of all participating bidders agencies contractors"
     return query
 
-# ---------------------------------------------------------------------------
-# Local LLM Fallback (Phi-3-mini-4k via gpt4all)
-# ---------------------------------------------------------------------------
-def _llm_answer(query: str, chunks: list[dict], extracted_fields: dict = None, force_bidder_mode: bool = False) -> str | None:
-    global _phi3_model
-    try:
-        from gpt4all import GPT4All
-        from config import GPT4ALL_MODEL
-        import os
 
-        model_dir  = os.path.join(os.path.expanduser("~"), ".cache", "gpt4all")
-        model_path = os.path.join(model_dir, GPT4ALL_MODEL)
-        if not os.path.exists(model_path):
-            print(f"  [llm] Model not found at {model_path}. Skipping.")
+# ---------------------------------------------------------------------------
+# Local LLM Fallback (Mistral-7B-Instruct via llama-cpp-python)
+# ---------------------------------------------------------------------------
+
+def _llm_answer(query: str, chunks: list[dict], extracted_fields: dict = None,
+                force_bidder_mode: bool = False, custom_prompt: str = None) -> str | None:
+    try:
+        import ollama
+        from config import OLLAMA_MODEL, LLM_ENABLED
+
+        if not LLM_ENABLED:
             return None
 
-        if _phi3_model is None:
-            print("  [llm] Loading Phi-3-mini...")
-            _phi3_model = GPT4All(GPT4ALL_MODEL, model_path=model_dir, verbose=False)
-            print("  [llm] Ready.")
-
-        # Context Deduplication
-        seen_content = set()
-        deduped_chunks = []
+        # ── Deduplicate chunks ────────────────────────────────────────────
+        seen_content: set = set()
+        deduped_chunks: list = []
         for chunk in chunks:
-            raw_text = clean_ocr_text(chunk["text"])
+            text_val = chunk.get("text") or chunk.get("content") or ""
+            raw_text = clean_ocr_text(text_val)
             norm = re.sub(r'\W+', '', raw_text.lower())
             if norm not in seen_content:
                 seen_content.add(norm)
                 deduped_chunks.append(chunk)
 
+        # ── Build context — cleaned before sending to LLM ─────────────────
         context_parts = []
-        LLM_CONTEXT_LIMIT = 8
-        for i, chunk in enumerate(deduped_chunks[:LLM_CONTEXT_LIMIT], 1):
-            text = clean_ocr_text(chunk["text"])[:400]
-            src  = chunk["filename"].replace("\\", "/").split("/")[-1]
-            context_parts.append(f"[Chunk {i} | Source: {src}]\n{text}")
+        for i, chunk in enumerate(deduped_chunks[:6], 1):
+            text_val = chunk.get("text") or chunk.get("content") or ""
+            # clean_for_llm strips PDF garbage (stray chars, broken unicode)
+            text = clean_for_llm(clean_ocr_text(text_val))[:600]
+            src  = chunk.get("filename", "unknown").replace("\\", "/").split("/")[-1]
+            meta = chunk.get("metadata") or {}
+            page = meta.get("page_number", "?") if isinstance(meta, dict) else "?"
+            context_parts.append(f"[DOCUMENT EXTRACT {i}]\nSource: {src} | Page: {page}\n{text}\n")
         context_str = "\n\n".join(context_parts)
 
-        if force_bidder_mode:
+        # ── Build prompt ───────────────────────────────────────────────────
+        if custom_prompt:
+            prompt = custom_prompt
+        elif force_bidder_mode:
             prompt = (
-                "<|system|>\n"
-                "You are a strict data extraction assistant.\n"
-                "1. Extract ONLY the bidder names from the provided text.\n"
-                "2. If bidders exist, list them clearly.\n"
-                "3. If the answer is not present in the context, say 'Answer not found in document'. Do not guess.\n"
-                "4. Cite the Page/Source number.\n"
-                "<|user|>\n"
-                f"Document Context:\n{context_str}\n\n"
-                f"Question:\n{query}\n"
-                "<|assistant|>\n"
+                "You are a government document assistant.\n"
+                "Extract ALL bidder/contractor/agency names from the context below.\n"
+                "List each name on a separate line.\n"
+                "If NO names are found, write: कोई बोलीदाता नहीं मिला\n\n"
+                f"Context:\n{context_str}\n\n"
+                f"Question: {query}\n"
+                "Answer:"
             )
         else:
             fields_str = ""
@@ -1125,71 +1360,96 @@ def _llm_answer(query: str, chunks: list[dict], extracted_fields: dict = None, f
                 clean_fields = {k: v for k, v in extracted_fields.items() if k != "Source"}
                 if clean_fields:
                     fields_str = (
-                        "\nVerified extracted facts (do NOT contradict these):\n" +
-                        "\n".join(f"  - {k}: {v}" for k, v in clean_fields.items()) + "\n"
+                        "Already extracted facts:\n" +
+                        "\n".join(f"  {k}: {v}" for k, v in clean_fields.items()) + "\n\n"
                     )
+            
             prompt = (
-                "You are a strict government records assistant.\n"
-                "Rules:\n"
-                "1. Answer ONLY using the provided Context. Do NOT guess or use outside knowledge.\n"
-                "2. If the answer is not present, say: 'Answer not found in the document.'\n"
-                "3. Reply in Hindi/English mix. Be direct and factual.\n"
-                "4. For yes/no questions, start with 'Haan!' or 'Nahi.' clearly.\n"
-                "5. Keep it concise: 2-3 lines max. Cite the source filename from the [Source: filename] label provided in the Context.\n"
-                "6. CRITICAL: Do NOT invent, hallucinate, or use any filename that is NOT explicitly labeled in the Context below. If unsure of the filename, just use the information provided.\n"
-                f"{fields_str}\n"
-                f"Context:\n{context_str}\n\n"
-                f"Question: {query}\n\n"
-                "Answer:"
+                "You are a document question-answering assistant. Answer in Hindi.\n\n"
+                "Follow these rules strictly:\n"
+                "1. Answer ONLY using the information provided in the CONTEXT.\n"
+                "2. Do NOT use outside knowledge.\n"
+                "3. If the answer is not clearly present in the context, say:\n"
+                "   जानकारी उपलब्ध नहीं है\n"
+                "4. If numbers or dates appear in the context, copy them exactly.\n"
+                "5. Do NOT guess or infer missing data.\n"
+                "6. Be concise and factual (1-2 lines).\n\n"
+                "---\n\n"
+                "CONTEXT:\n"
+                f"{fields_str}"
+                f"{context_str}\n\n"
+                "---\n\n"
+                "QUESTION:\n"
+                f"{query}\n\n"
+                "---\n\n"
+                "INSTRUCTIONS:\n"
+                "* Extract the relevant information from the context.\n"
+                "* If multiple values exist, return the most relevant one.\n"
+                "* If the answer cannot be found, say the document does not contain it.\n\n"
+                "ANSWER:"
             )
 
-        print(f"  [llm] Generating answer...")
-        with _phi3_model.chat_session():
-            response = _phi3_model.generate(prompt, max_tokens=120, temp=0.05)
-        response = response.strip()
-        if not response:
+        print(f"  [llm] Generating answer via Ollama ({OLLAMA_MODEL})...")
+        try:
+            output = ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                options={
+                    "temperature": 0.05,
+                    "num_ctx": 4096
+                }
+            )
+            response = output.get("message", {}).get("content", "").strip()
+            if not response:
+                return None
+            print(f"  [llm] Done ({len(response)} chars)")
+        except Exception as gen_err:
+            print(f"  [llm] Generation failed: {gen_err}")
             return None
-        print(f"  [llm] Done ({len(response)} chars)")
 
         _REFUSAL = ('i cannot', "i'm sorry", "i don't know", 'not enough information',
                     'maafi chahta hoon', 'jankari nahi', 'not found in document',
                     'yeh jankari documents mein nahi')
         if len(response) < 15 or any(r in response.lower() for r in _REFUSAL):
-            print("  [llm] LLM refused or did not find answer: 'Answer not found in document'")
-            return "⚠️ Answer not found in the document. I searched the relevant pages but could not verify this information."
+            print("  [llm] LLM refused — no clear answer found.")
+            return "⚠️ Answer not found in the document."
 
-        # Numeric Extraction Guard (regex + word-to-digit validation)
-        # Prevents LLM numbering hallucinations by checking if digits exist in context.
+        # Numeric hallucination guard (Relaxed: must have AT LEAST ONE grounded number if numbers are generated)
         money_matches = re.findall(r'₹?\s*\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d{4,}', response)
-        
         try:
             from rag_utils import words_to_digits_string
             word_numbers = words_to_digits_string(response)
         except ImportError:
             word_numbers = []
-            
-        all_targets = money_matches + word_numbers
-        
-        for mm in all_targets:
-            num_val = re.sub(r'[^\d]', '', mm)
-            if len(num_val) >= 2:
-                context_digits = re.sub(r'[^\d]', '', context_str)
-                if num_val not in context_digits:
-                    print(f"  [llm] Hallucination guard triggered (Number {mm} not in context)")
-                    return "Answer not found in the document."
 
-        # Reject if LLM is hallucinating Q&A pairs from the context
+        all_numbers = money_matches + word_numbers
+        if all_numbers:
+            context_digits_str = re.sub(r'[^\d]', '', context_str)
+            found_grounded = False
+            for mm in all_numbers:
+                num_val = re.sub(r'[^\d]', '', mm)
+                if len(num_val) >= 2 and num_val in context_digits_str:
+                    found_grounded = True
+                    break
+            
+            if not found_grounded:
+                # None of the significant numbers generated by the LLM were in the context
+                print(f"  [llm] Hallucination guard: None of generated numbers {all_numbers} in context")
+                return "Answer not found in the document."
+
         if re.search(r'(?i)\bQuestion\s*:', response) or response.count('?') > 2:
-            print("  [llm] Response rejected (hallucinated Q&A), using regex fallback")
+            print("  [llm] Rejected: hallucinated Q&A pairs")
             return None
 
         return response
 
-    except ImportError:
-        print("  [llm] gpt4all not installed.")
+    except ImportError as ie:
+        print(f"  [llm] llama-cpp-python not installed: {ie}")
         return None
     except Exception as e:
-        print(f"  [llm] Error: {e}")
+        print(f"  [llm] Unexpected error: {e}")
         return None
 
 
@@ -1279,237 +1539,127 @@ def answer_query(
     filename_filter: str | None = None,
     category_filter: str | None = None,
 ):
-    """Main entry point — yields streaming response events for the frontend."""
+    """Refined entry point for Land Record Chatbot with Proactive Questioning."""
     from database import (
-        query_by_agency, query_by_plot, query_by_allottee,
-        get_all_fields_for_file, write_audit,
+        query_by_plot, query_by_allottee, get_all_fields_for_file, write_audit
     )
 
+    # 1. NORMALIZE & DETECT HINGLISH INTENT
+    # This handles "plot number xyz is approved or not?" or "village name me kitne plot hai?"
     query, correction_note = normalize_query(query)
     intents = detect_intent(query)
+    asked_plot = extract_plot_number_from_query(query)
 
     # -----------------------------------------------------------------------
-    # FAST PATH: SQLite structured metadata lookup
-    # For known-entity queries (bid existence, plot, allottee, bidder lists)
-    # try the DB first — no vector search, no reranking, deterministic, <40ms.
+    # PROACTIVE LOGIC: Requirement 1 (Self-Questioning)
     # -----------------------------------------------------------------------
-    if not filename_filter and not category_filter:
-        db_rows: list[dict] = []
-        is_list_bidders = "list_bidders" in intents
-
-        if is_list_bidders:
-            # Table extraction: we need to find the correct document if the user provides 
-            # some context, otherwise we let the Hybrid Path retrieve the document, 
-            # but since SQLite bidder lookup requires a filename, we will handle list_bidders 
-            # in Hybrid Path if filename is unknown, or we can see if there is an agency name in query
-            pass
-
-        if "Bid Existence" in intents or "Agency Name" in intents:
-            person_words = _extract_person_names(query)
-            for pw in person_words:
-                if len(pw) >= 4:
-                    db_rows = query_by_agency(pw)
-                    if db_rows:
-                        break
-
-        elif "Plot Number" in intents:
-            asked_plot = extract_plot_number_from_query(query)
-            if asked_plot:
-                db_rows = query_by_plot(asked_plot)
-
-        elif "Allottee Name" in intents:
-            person_words = _extract_person_names(query)
-            for pw in person_words:
-                if len(pw) >= 4:
-                    db_rows = query_by_allottee(pw)
-                    if db_rows:
-                        break
-
-        if db_rows:
-            row = db_rows[0]
-            fname = row.get("filename", "")
-            src   = fname.split("/")[-1] if fname else "metadata.db"
-            ocr_q = row.get("ocr_quality", 1.0)
-
-            # Build structured fields dict from SQLite row
-            fields = {
-                "Agency Name":       row.get("agency_name", ""),
-                "Ref. Number":       row.get("ref_number", ""),
-                "Tender Amount":     row.get("tender_amount", ""),
-                "Schedule Discount": row.get("schedule_discount", ""),
-                "Date of Casting":   row.get("date_casting", ""),
-                "Date of Testing":   row.get("date_testing", ""),
-                "W.O. Number":       row.get("wo_number", ""),
-                "Name of Division":  row.get("division", ""),
-                "Plot Number":       row.get("plot_number", ""),
-                "Plot Size":         row.get("plot_size", ""),
-                "Deposit Amount":    row.get("deposit_amount", ""),
-                "Scheme Name":       row.get("scheme_name", ""),
-                "Allottee Name":     row.get("allottee_name", ""),
-                "Maturity Date":     row.get("maturity_date", ""),
-                "FD Account No":     row.get("fd_account", ""),
-            }
-            fields = {k: v for k, v in fields.items() if v}
-
-            ocr_warning = ""
-            if ocr_q < 0.5:
-                ocr_warning = (
-                    "\n\n> ⚠️ **OCR quality low** ("
-                    f"{ocr_q:.0%}) — some fields may be missing or incorrect."
-                )
-
-            table_data = [{**fields, "Source": src}]
-            answer_text = build_natural_answer(query, fields, [fname], [])
-            if correction_note:
-                answer_text = correction_note + "\n\n" + answer_text
-            answer_text += ocr_warning
-
-            print(f"  [sqlite-fast] Answered from DB in <40ms ({src})")
-            write_audit(query, intents=[i for i in intents], doc_ids=[fname],
-                        chunks_returned=0, llm_used=False)
-
-            yield {"type": "meta", "table": table_data, "sources": [src], "context_count": 0}
-            yield {"type": "content", "content": answer_text}
-            yield {"type": "detail",  "content": ""}
-            yield {"type": "sources_detail", "content": []}
-            return
-
-    # -----------------------------------------------------------------------
-    # STANDARD PATH: Hybrid retrieval — BM25 + vector + rerank + regex
-    # -----------------------------------------------------------------------
-    context_chunks = retrieve_context(
-        query,
-        filename_filter=filename_filter,
-        category_filter=category_filter,
-    )
-
-    if not context_chunks:
-        yield {
-            "type":    "error",
-            "content": (
-                "No relevant records were found.\n\n"
-                "**Suggestions:**\n"
-                "- Include ward number, sector, or agency name\n"
-                "- Make sure the PDF is indexed (use the Scan button)\n"
-                "- Try rephrasing in English"
-            )
-        }
+    # If query is too short or lacks specific keywords, suggest critical land checks
+    critical_keywords = ["stay", "loan", "rc", "mismatch", "recovery", "acquisition"]
+    if len(query.split()) < 4 and not any(k in query.lower() for k in critical_keywords):
+        proactive_msg = (
+            f"Mujhe Plot/Khasra **{asked_plot if asked_plot else ''}** ki file mil gayi hai. \n\n"
+            "Kya aap is property ke baare mein ye jaanna chahte hain:\n"
+            "1. “Kya is khasra/plotno par kisi bhi prakaar ka stay order currently active hai?”\n"
+            "2. “Is property ke khilaf kisi bhi prakar ki revenue recovery (RC) pending hai?”\n"
+            "3. “Is land par abhi tak koi government acquisition notice issue hua hai?”"
+        )
+        yield {"type": "content", "content": proactive_msg}
         return
 
-    asked_plot = extract_plot_number_from_query(query)
+    # -----------------------------------------------------------------------
+    # FAST PATH: SQL Structured Metadata Lookup
+    # -----------------------------------------------------------------------
+    db_rows = []
     if asked_plot:
-        plot_pattern = _build_plot_filter_pattern(asked_plot)
-        filtered     = [c for c in context_chunks if re.search(plot_pattern, c["text"], re.IGNORECASE)]
-        if filtered:
-            context_chunks = filtered
-            print(f"  [plot-filter] {len(filtered)} chunks matched")
-        else:
-            not_found_msg = (
-                f"indexed documents में **भूखंड संख्या {asked_plot}** का कोई record नहीं मिला।"
-                f"\n\n**संभावित कारण:**\n"
-                f"- यह भूखंड संख्या PDF में अलग format में हो सकती है\n"
-                f"- फ़ाइल का OCR इस पेज को सही से नहीं पढ़ सका\n"
-                f"- PDF को re-scan करें (Scan button) और फिर कोशिश करें"
-            )
-            if correction_note:
-                not_found_msg = correction_note + "\n\n" + not_found_msg
-            yield {"type": "meta", "table": [], "sources": [], "context_count": 0}
-            yield {"type": "content", "content": not_found_msg}
-            yield {"type": "detail",  "content": ""}
-            yield {"type": "sources_detail", "content": []}
-            return
+        db_rows = query_by_plot(asked_plot)
+    
+    if db_rows:
+        row = db_rows[0]
+        # LOGIC FOR REQUIREMENT 5: Area Mismatch Detection
+        # Compare DB value vs what user thinks (if mentioned in query)
+        user_area_match = re.search(r"(\d+(\.\d+)?) hectare", query.lower())
+        if user_area_match and row.get("land_area_recorded"):
+            user_val = float(user_area_match.group(1))
+            db_val = float(row["land_area_recorded"])
+            if abs(user_val - db_val) > 0.01:
+                correction_note = (
+                    f"⚠️ **Data Mismatch Detected:** Aapne {user_val} hectare pucha hai, "
+                    f"lekin sarkari record (PDF) mein ye **{db_val} hectare** dikh raha hai."
+                )
 
-    # Handle fast SQLite Table fetching if intent is list_bidders
-    if "list_bidders" in intents and context_chunks:
-        from database import query_bidders_for_tender
-        top_file = context_chunks[0]["filename"]
-        bidders_db = query_bidders_for_tender(top_file)
+        # Build answer from SQL
+        fields = {k: v for k, v in row.items() if v and k not in ['id', 'file_hash']}
+        table_data = [{**fields, "Source": row['filename'].split("/")[-1]}]
+        answer_text = build_natural_answer(query, fields, [row['filename']], [])
         
-        short_src = top_file.split('/')[-1]
+        if correction_note:
+            answer_text = correction_note + "\n\n" + answer_text
+
+        yield {"type": "meta", "table": table_data, "sources": [row['filename']], "context_count": 0}
+        yield {"type": "content", "content": answer_text}
+        return
+
+    # -----------------------------------------------------------------------
+    # HYBRID PATH: For complex/historical queries (Requirement 1, 4, 8)
+    # -----------------------------------------------------------------------
+    context_chunks = retrieve_context(query, filename_filter, category_filter)
+
+    if not context_chunks:
+        yield {"type": "error", "content": "Records nahi mile. Kripya sahi se jaankaari likhein."}
+        return
+
+    # -----------------------------------------------------------------------
+    # AGENTIC LLM LAYER: For Requirement 10 (Legal Risk) & Requirement 4 (SC/ST)
+    # -----------------------------------------------------------------------
+    # We use the LLM to 'reason' over the OCR text extracted from NS.pdf/CS.pdf
+    # Aggressive truncation for Phi-3's 2048 token limit (Hindi chars eat more tokens)
+    formatted_context = ""
+    for i, c in enumerate(context_chunks[:3], 1):
+        text_snippet = (c.get("text") or c.get("content") or "")[:300].strip()
+        formatted_context += f"[Doc {i}: {c.get('filename', 'Unknown')}]\n{text_snippet}\n\n"
+
+    llm_prompt = f"""Context:
+{formatted_context}
+User Query: {query}
+Role: Expert Land Records & Legal Document Analyzer.
+Instructions:
+1. Analyze OCR text. If info not found, say "Mujhe ye jaankari nahi mili."
+2. Check for Legal Risk (Stay, Court, Vivad).
+3. Explain local terms (Khasra, Mutation).
+4. Check SC/ST ownership transfer restrictions.
+5. Answer in Hinglish.
+"""
+    
+    # Try LLM first (if enabled), fall back to regex extraction
+    answer_text = _llm_answer(query, context_chunks, custom_prompt=llm_prompt)
+    
+    # Fallback to regex extraction if LLM is disabled or failed
+    if answer_text is None:
+        all_info = {}
+        sources = []
+        for chunk in context_chunks[:5]:  # Process top 5 chunks
+            text = clean_ocr_text(chunk.get("text", ""))
+            if text:
+                info = extract_key_info(text)
+                for k, v in keyword_scan(text).items():
+                    if k not in info:
+                        info[k] = v
+                for k, v in info.items():
+                    if k not in all_info:
+                        all_info[k] = v
+            
+            fname = chunk["filename"]
+            parts = fname.replace("\\", "/").split("/")
+            display = " / ".join(parts[-3:]) if len(parts) >= 3 else fname
+            if display not in sources:
+                sources.append(display)
         
-        if bidders_db:
-            ans = f"**{short_src}** mein following bidders ne participate kiya tha:\n\n"
-            for idx, b in enumerate(bidders_db, 1):
-                amt = f" (₹{b['bid_amount']})" if b.get('bid_amount') else ""
-                rnk = f" - **{b['rank']}**" if b.get('rank') else ""
-                ans += f"{idx}️⃣ {b['bidder_name']}{amt}{rnk}\n"
-                
-            yield {"type": "meta", "table": [{"Source": short_src}], "sources": [short_src], "context_count": 0}
-            yield {"type": "content", "content": ans}
-            yield {"type": "detail", "content": ""}
-            yield {"type": "sources_detail", "content": []}
-            return
-        else:
-            print(f"  [sqlite-fast] No bidders found in SQLite for {short_src}, falling back to Agentic Hybrid Retrieval...")
-            # Agentic rewriting applies here for better context pulling from the vector DB
-            query = _rewrite_query(query, "list_bidders")
-
-    table_data:   list = []
-    seen_sources: list = []
-
-    for chunk in context_chunks:
-        src  = chunk["filename"]
-        text = clean_ocr_text(chunk["text"])
-        if not text:
-            continue
-        extraction_text = extract_row_for_plot(text, asked_plot) if asked_plot else text
-        info = extract_key_info(extraction_text)
-        if not any(k in info for k in ("Agency Name", "Date of Casting")):
-            info.update({k: v for k, v in keyword_scan(extraction_text).items() if k not in info})
-        if info:
-            info["Source"] = src.replace("\\", "/").split("/")[-1]
-            table_data.append(info)
-        parts   = src.replace("\\", "/").split("/")
-        display = " / ".join(parts[-3:]) if len(parts) >= 3 else src
-        if display not in seen_sources:
-            seen_sources.append(display)
+        answer_text = build_natural_answer(query, all_info, sources, context_chunks)
 
     yield {
-        "type":          "meta",
-        "table":         table_data,
-        "sources":       seen_sources,
+        "type": "meta",
+        "sources": list(set([c["filename"].split("/")[-1] for c in context_chunks])),
         "context_count": len(context_chunks),
     }
-
-    # Answer Forcing Prompt (Agent Validation layer)
-    if "list_bidders" in intents:
-        from config import GPT4ALL_MODEL  # Even if LLM_ENABLED=False globally, we force it for fallback
-        print("  [RAG] Booting LLM for Table Fallback Bidder Extraction...")
-        llm_resp = _llm_answer(query, context_chunks, force_bidder_mode=True)
-        if llm_resp:
-            answer_text = llm_resp + f"\n\n**(Agentic Retrieval Sources: {', '.join(seen_sources)})**"
-        else:
-            answer_text = format_answer(query, context_chunks)
-    else:
-        answer_text = format_answer(query, context_chunks)
-            
-    # OCR quality warning for hybrid path (mirrors SQLite fast-path behavior)
-    ocr_scores = [c.get("ocr_quality", 1.0) for c in context_chunks if "ocr_quality" in c]
-    if ocr_scores:
-        avg_ocr = sum(ocr_scores) / len(ocr_scores)
-        if avg_ocr < 0.5:
-            answer_text += (
-                "\n\n> ⚠️ **OCR quality low** ("
-                f"{avg_ocr:.0%}) — some fields may be missing or incorrect."
-            )
-
-    if correction_note:
-        answer_text = correction_note + "\n\n" + answer_text
+    
     yield {"type": "content", "content": answer_text}
-
-    yield {"type": "detail", "content": build_detail_text(context_chunks)}
-
-    seen_fnames: set = set()
-    deduped:    list = []
-    for c in context_chunks:
-        fn = c["filename"].replace("\\", "/").split("/")[-1]
-        if fn not in seen_fnames:
-            seen_fnames.add(fn)
-            deduped.append(c)
-
-    # Audit log — hash only, no raw text
-    doc_ids = [c["filename"] for c in context_chunks]
-    write_audit(query, intents=[i for i in intents], doc_ids=doc_ids,
-                chunks_returned=len(context_chunks), llm_used=False)
-
-    yield {"type": "sources_detail", "content": deduped}

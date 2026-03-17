@@ -26,29 +26,46 @@ class DocMetadata(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String, unique=True, nullable=False, index=True)
+    file_hash = Column(String, index=True) # Add this to detect content changes
+
+    # --- Existing fields (Keep for compatibility) ---
     category = Column(String, default='')
     case_number = Column(String, default='', index=True)
-    agency_name = Column(String, default='')
-    agency_name_norm = Column(String, default='', index=True)
-    ref_number = Column(String, default='', index=True)
-    tender_amount = Column(String, default='')
-    schedule_discount = Column(String, default='')
-    date_casting = Column(String, default='')
-    date_testing = Column(String, default='')
-    wo_number = Column(String, default='')
-    division = Column(String, default='')
     plot_number = Column(String, default='', index=True)
-    plot_size = Column(String, default='')
-    deposit_amount = Column(String, default='')
-    scheme_name = Column(String, default='')
+    scheme_name = Column(String, default='') # e.g., "Chittorgarh Road Yojana"
     allottee_name = Column(String, default='')
-    allottee_norm = Column(String, default='', index=True)
-    maturity_date = Column(String, default='')
-    fd_account = Column(String, default='')
     ocr_quality = Column(Float, default=1.0)
-    file_hash = Column(String, default='', index=True) # SHA-256 integrity hash
     indexed_at = Column(DateTime(timezone=True))
+    # --- NEW FIELDS FOR YOUR 10 REQUIREMENTS ---
+    
+    # Requirement 5: Area Mismatch detection
+    land_area_recorded = Column(Float, default=0.0) # From the official table
+    land_area_unit = Column(String, default='sq yards') # or hectare
+    
+    # Requirement 2: Loan/Bank Info
+    has_active_loan = Column(String, default='No') 
+    bank_name = Column(String, default='')
+    loan_expiry_date = Column(String, default='')
+    
+    # Requirement 1 & 6: Legal/Stay Orders
+    has_stay_order = Column(String, default='No')
+    court_case_id = Column(String, default='')
+    next_hearing_date = Column(String, default='')
 
+    agency_name = Column(String, default='') 
+    division = Column(String, default='')
+    
+    # Requirement 4: SC/ST Restrictions
+    is_sc_st_restricted = Column(String, default='No')
+    restriction_section = Column(String, default='') # e.g., "Section 175"
+    
+    # Requirement 1: Revenue Recovery (RC)
+    rc_pending_amount = Column(Float, default=0.0)
+    
+    # Requirement 9: GIS/Hazard Info (Extracted from text)
+    is_flood_zone = Column(String, default='Unknown')
+
+    file_hash = Column(String, default='', index=True)
 class TenderBidder(Base):
     __tablename__ = "tender_bidders"
 
@@ -86,16 +103,26 @@ class AuditLog(Base):
 # --- Initialization ----------------------------------------------------------
 
 def init_db():
+    # 1. Create tables based on the class above
     Base.metadata.create_all(bind=engine)
-    # Create PostgreSQL full text search indexes and extension
-    with engine.begin() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm;"))
-        # FTS index on combined text for fuzzy searching names/schemes
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS doc_metadata_fts_idx ON doc_metadata 
-            USING GIN (to_tsvector('english', coalesce(agency_name, '') || ' ' || coalesce(allottee_name, '') || ' ' || coalesce(scheme_name, '') || ' ' || coalesce(division, '')));
-        """))
-
+    
+    # 2. Create the index inside a try block
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS doc_metadata_fts_idx ON doc_metadata 
+                USING GIN (to_tsvector('english', 
+                    coalesce(agency_name, '') || ' ' || 
+                    coalesce(allottee_name, '') || ' ' || 
+                    coalesce(scheme_name, '') || ' ' || 
+                    coalesce(division, '')
+                ));
+            """))
+            conn.commit()
+            print("PostgreSQL: Table and Search Index ready.")
+        except Exception as e:
+            print(f"Note: Search index exists or skipped: {e}")
+            
 # --- Ingestion helpers -------------------------------------------------------
 
 def _norm(val: str) -> str:
@@ -152,6 +179,33 @@ def upsert_tender_bidders(filename: str, bidders: list[dict]) -> None:
                     rank=b.get("rank", "")
                 )
                 db.add(bidder)
+        db.commit()
+
+def upsert_document_metadata(data: dict):
+    """Saves or updates the structured land records in PostgreSQL."""
+    with SessionLocal() as db:
+        existing = db.query(DocMetadata).filter(DocMetadata.filename == data['filename']).first()
+        if existing:
+            for key, value in data.items():
+                setattr(existing, key, value)
+        else:
+            new_meta = DocMetadata(**data)
+            db.add(new_meta)
+        db.commit() 
+
+def save_doc_metadata(filename: str, category: str, **kwargs):
+    with SessionLocal() as db:
+        # Check if file already exists
+        doc = db.query(DocMetadata).filter(DocMetadata.filename == filename).first()
+        if not doc:
+            doc = DocMetadata(filename=filename, category=category)
+            db.add(doc)
+        
+        # Dynamically update any extra fields (area, plot_number, etc.)
+        for key, value in kwargs.items():
+            if hasattr(doc, key):
+                setattr(doc, key, value)
+        
         db.commit()
 
 def clear_metadata() -> None:
@@ -225,6 +279,13 @@ def get_all_fields_for_file(filename: str) -> dict | None:
     with SessionLocal() as db:
         doc = db.query(DocMetadata).filter(DocMetadata.filename == filename).first()
         return _row_to_dict(doc)
+    
+def get_all_indexed_filenames() -> list[str]:
+    """Helper for main.py to identify new files on disk."""
+    with SessionLocal() as db:
+        # Returns a list of strings like ['NS.pdf', 'CS.pdf']
+        results = db.query(DocMetadata.filename).all()
+        return [r.filename for r in results]
 
 # --- Audit logging -----------------------------------------------------------
 
