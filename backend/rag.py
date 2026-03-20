@@ -1,7 +1,16 @@
 import os
+import sys
 import re
+import unicodedata
 import uuid
+import json
 from typing import Optional
+
+# Production-Grade System Setup (v7)
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except: pass
 
 import chromadb
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -467,7 +476,10 @@ def _build_bm25_index():
     # Diagnostic: print the first chunk to confirm index is clean
     if corpus:
         preview = corpus[0]["text"][:200].replace("\n", " ")
-        print(f"  [BM25 SANITY] First chunk preview: {preview}...")
+        try:
+            print(f"  [BM25 SANITY] First chunk preview: {preview}...")
+        except UnicodeEncodeError:
+            print(f"  [BM25 SANITY] First chunk preview: {preview.encode('ascii', 'ignore').decode('ascii')}... (Unicode stripped for terminal)")
 
 
 def _invalidate_bm25():
@@ -510,9 +522,11 @@ def retrieve_context(
     filename_filter: str | None = None,
     category_filter: str | None = None,
 ) -> list[dict]:
-    """Hybrid BM25 + vector search fused via Reciprocal Rank Fusion."""
-    intents = detect_intent(query)
-    queries = [query] + [f"{intent} {query}" for intent in intents]
+    # Hybrid BM25 + vector search fused via Reciprocal Rank Fusion.
+    intents = detect_intents(query)
+    queries = [query]
+    for intent in intents:
+        queries.append(f"{intent} {query}")
 
     # --- vector retrieval (optional, requires embedding model) ---
     vector_chunks: list[dict] = []
@@ -623,18 +637,30 @@ def retrieve_context(
         rrf_s   = chunk.get("score", 0)
         preview = chunk["text"][:120].replace("\n", " ")
         fname   = chunk.get("filename", "unknown").split("/")[-1]
-        print(f"    Chunk {i+1} (rrf={rrf_s:.4f}, file={fname}): {preview}...")
+        try:
+            print(f"    Chunk {i+1} (rrf={rrf_s:.4f}, file={fname}): {preview}...")
+        except UnicodeEncodeError:
+            print(f"    Chunk {i+1} (rrf={rrf_s:.4f}, file={fname}): {preview.encode('ascii', 'ignore').decode('ascii')}...")
 
     # ── Quality filter using RAW VECTOR score (not RRF) ──────────────────
     # RRF scores are inherently tiny (1/(60+rank) ≈ 0.016 for rank 1).
-    # Comparing 0.049 against 0.15 will always fail. Use cosine similarity instead.
-    # 0.50 = "at least somewhat semantically related"
-    # 3 chunks minimum to give LLM enough context
+    # Using adaptive thresholding based on detected intent:
+    
+    # Defaults
     MIN_VECTOR_SCORE = 0.50
     MIN_CHUNK_COUNT  = 3
+    
+    # Intent-Aware Adaptive Thresholding (v8)
+    high_value_intents = {"DEPOSIT", "DEPOSIT_RESIDENTIAL", "DEPOSIT_COMMERCIAL", "SIZE", "PLOT"}
+    if any(it in intents for it in high_value_intents):
+        # We have a strong keyword match, be more lenient with semantic search
+        MIN_VECTOR_SCORE = 0.35
+        MIN_CHUNK_COUNT  = 1
+        print(f"  [retrieval] Intent detected ({intents}) -> LOWERING thresholds (score={MIN_VECTOR_SCORE}, count={MIN_CHUNK_COUNT})")
+
     if raw_vector_top < MIN_VECTOR_SCORE or len(fused) < MIN_CHUNK_COUNT:
-        print(f"  [retrieval] LOW CONFIDENCE — raw_vector_top={raw_vector_top:.3f} "
-              f"chunks={len(fused)} → returning empty")
+        print(f"  [retrieval] LOW CONFIDENCE - raw_vector_top={raw_vector_top:.3f} "
+              f"chunks={len(fused)} -> returning empty")
         return []   # caller returns 'जानकारी उपलब्ध नहीं है'
 
     # Return top 6 to LLM
@@ -688,7 +714,9 @@ def extract_key_info(text: str) -> dict:
         "Ref. Number":       r"(?i)(?:Ref\.?\s*No\.?|NIT|Bid\s*No\.?)\s*[:\-=]*\s*([\w][\w\s\-/.]{2,30})",
         "Plot Number":       r"(?i)(?:भूखंड|भूखण्ड|bhu\s*khand|plot|पट्टी)\s*(?:sankhya|संख्या|no\.?|number|क्रमांक)?\s*[:\-.=]*\s*([0-9A-Za-z][0-9A-Za-z\-/]{0,8}?)(?=[\s,।/\n]|$)",
         "Plot Size":         r"(?i)(?:क्षेत्रफल|kshetrafal|area|आकार|akar|size|माप|maap|साईज)\s*(?:का\s*)?[:\-=\/.]*\s*([0-9.,]+)(?:\s*(?:sqm|sq\.?\s*m|वर्ग\s*मीटर|वर्ग|gaj|गज|sq\.?\s*ft|sq\.?\s*yard|bigha|बिघा|acre|एकड़))?",
-        "Deposit Amount":    r"(?i)(?:अमानत\s*राशि|वाणिज्यिक|जमाराशि|jama\s*rashi|deposit\s*amount|रकम|राशि|शुल्क)\s*[:\-=]*\s*(?:Rs\.?|₹|INR|रु\.?|रू\.?)?\s*([\d,]+(?:\.\d+)?)",
+        "Deposit Amount":    r"(?i)(?:अमानत\s*राशि|जमाराशि|jama\s*rashi|deposit\s*amount|रकम|राशि|शुल्क)\s*[:\-=]*\s*(?:Rs\.?|₹|INR|रु\.?|रू\.?)?\s*([\d,]{4,12})",
+        "Deposit (Residential)": r"(?i)आवासीय\s*[-–:—]\s*(?:Rs\.?|₹|INR|रु\.?|रू\.?)?\s*([\d,]{4,12})",
+        "Deposit (Commercial)": r"(?i)वाणिज्यिक?\s*[-–:—]\s*(?:Rs\.?|₹|INR|रु\.?|रू\.?)?\s*([\d,]{4,12})",
         "Scheme Name":       r"(?i)(?:योजना|yojana|scheme)\s*(?:का\s*नाम|name)?\s*[:\-.=]*\s*([^,\n\|]{2,60}?)(?=\n|,|\||\d|$)",
         "Second Party":      r"(?i)(?:दूसरा\s*पक्ष|second\s*party|party\s*2|दूसरा|पक्ष)[\s:.\-=]*([A-Za-z\s\u0900-\u097F]{2,60}?)(?=\n|,|$)",
         "Owner":             r"(?i)(?:मालिक|malik|owner|धारक|darak|पट्टेदार|pattadar|स्वामी|malik|malik)\s*[:\-.=]*\s*([A-Za-z\s\u0900-\u097F]{2,60}?)(?=\n|,|$)",
@@ -1127,50 +1155,420 @@ def extract_row_for_plot(chunk_text: str, asked_plot: str) -> str:
     return chunk_text[s:e]
 
 
-def detect_intent(query: str) -> list[str]:
+# --- Production-Grade Extraction Engine ---
+
+# --- Upgraded Multi-Signal Scoring Engine ---
+
+PATTERN_WEIGHTS = {
+    "STRICT": 5,
+    "SEMANTIC": 3,
+    "CONTEXTUAL": 2,
+    "LOOSE": 1
+}
+
+CONTEXT_WEIGHTS = {
+    "EXACT": 15,
+    "PARTIAL": 5,
+    "NONE": 0
+}
+
+LABEL_MAP = {
+    "आवासीय": "residential",
+    "वाणिज्यिक": "commercial",
+    "resi": "residential",
+    "residential": "residential",
+    "comm": "commercial",
+    "commercial": "commercial",
+    "emd": "emd",
+    "deposit": "deposit"
+}
+
+def normalize_numbers(text):
+    if not text: return ""
+    devanagari_map = str.maketrans("०१२३४५६७८९", "0123456789")
+    return text.translate(devanagari_map)
+
+def extract_relevant_snippet(line):
+    if not line: return ""
+    # Truncate if too long, but usually segment_chunk already gives small lines
+    return line.strip()[:200]
+
+INTENT_MAP = {
+    "amanat": {
+        "keywords": ["अमानत", "जमानत", "emd", "deposit", "पंजीयन", "money", "राशि", "रकम", "jama"],
+        "patterns": [
+            {"regex": r'(?:अमानत|जमानत)\s*राशि[^0-9]*?₹?\s*([\d,]+)', "type": "STRICT"},
+            {"regex": r'(?:अमानत|जमानत|emd|deposit|पंजीयन)[^0-9]*?₹?\s*([\d,]+)', "type": "SEMANTIC"},
+            {"regex": r'(?:आवासीय|वाणिज्यिक|residential|commercial)[^0-9]*?₹?\s*([\d,]+)', "type": "CONTEXTUAL"},
+            {"regex": r'₹?\s*([\d,]+)\s*(?:रू|inr|rs)', "type": "LOOSE"}
+        ],
+        "constraints": {"min": 1000, "max": 10000000},
+        "context_keywords": ["आवासीय", "वाणिज्यिक", "residential", "commercial"]
+    },
+    "plot_size": {
+        "keywords": ["क्षेत्रफल", "size", "area", "आकार", "varg", "वर्ग", "गज", "meter"],
+        "patterns": [
+            {"regex": r'(?:क्षेत्रफल|size|area|आकार|माप)[:\-=\/.]*\s*([0-9.,]+)', "type": "STRICT"},
+            {"regex": r'([0-9.,]+)\s*(?:sqm|sq\.?\s*m|वर्ग\s*मीटर|गज|gaj)', "type": "SEMANTIC"}
+        ],
+        "constraints": {"min": 1, "max": 100000},
+        "context_keywords": ["आवासीय", "वाणिज्यिक"]
+    }
+}
+
+KEYWORD_WEIGHTS = {
+    "अमानत": 5, "जमानत": 5, "emd": 5, "deposit": 5, "राशि": 1, "रकम": 1,
+    "क्षेत्रफल": 5, "size": 5, "area": 5, "plot": 1, "भूखंड": 2
+}
+
+def is_clean_text(text):
+    """Aggressive OCR noise filter (v7)"""
+    t = text.strip()
+    if len(t) < 10:
+        return False
+
+    # Too many weird symbols (non-alphanumeric, non-hindi, non-currency)
+    weird_symbols = re.findall(r"[^\w\s₹,.()-]", t)
+    if len(weird_symbols) > 5:
+        return False
+
+    # Broken words ratio (too many tiny fragments)
+    words = t.split()
+    if not words: return False
+    bad_words = [w for w in words if len(w) <= 2]
+    if len(bad_words) / max(len(words), 1) > 0.4:
+        return False
+
+    return True
+
+def segment_chunk(chunk):
+    if not chunk: return []
+    # Simplified splitting to keep more context within lines if possible
+    return [ln.strip() for ln in re.split(r'[।\n\|]', chunk) if len(ln.strip()) > 3]
+
+def is_valid_amount_strict(val, line):
+    """Ensures value looks like currency and not a plot number or area."""
+    # Check for currency markers or formatted thousands
+    has_marker = any(m in line for m in ["₹", "रू", "rs", "inr", "deposit", "राशि", "रकम"])
+    has_separator = "," in val
+    
+    # Heuristic: Plot numbers are usually short (3-4 digits) without separators
+    # Areas often follow 'sqm' or 'varg' which is handled by intent config
+    
+    return has_marker or has_separator
+
+def is_valid_block(lines, intent_keywords):
+    """Confirms if the intent is present anywhere in the block."""
+    block_text = " ".join(lines).lower()
+    return any(k.lower() in block_text for k in intent_keywords)
+
+def is_valid_signal_line(line, intent_keywords):
+    """Strict check: line itself must contain intent keywords."""
+    line_lower = line.lower()
+    return any(k.lower() in line_lower for k in intent_keywords)
+
+def _normalize(text):
+    if not text: return ""
+    return unicodedata.normalize('NFKC', text).lower().strip()
+
+def _super_clean(text):
+    if not text: return ""
+    # Standardize all whitespace and remove symbols for comparison
+    return re.sub(r'[^\u0900-\u097F0-9a-zA-Z]', '', _normalize(text))
+
+def get_context_score(line, chunk_text, query_hint, context_keywords):
+    if not query_hint: return 0
+    
+    line_norm = _normalize(line)
+    chunk_norm = _normalize(chunk_text)
+    hint_norm = _normalize(query_hint)
+    
+    # Priority 1: Exact Hint in the current line
+    if hint_norm in line_norm or _super_clean(hint_norm) in _super_clean(line_norm):
+        return CONTEXT_WEIGHTS["EXACT"]
+    
+    # Priority 2: Exact Hint in the parent chunk
+    if hint_norm in chunk_norm or _super_clean(hint_norm) in _super_clean(chunk_norm):
+        return CONTEXT_WEIGHTS["PARTIAL"] + 1 # Higher than partial, but lower than EXACT line match (e.g., 3)
+    
+    # Priority 3: Context keywords matching
+    for ck in context_keywords:
+        ck_norm = _normalize(ck)
+        if ck_norm in hint_norm:
+            if ck_norm in line_norm or _super_clean(ck_norm) in _super_clean(line_norm):
+                return CONTEXT_WEIGHTS["PARTIAL"]
+            if ck_norm in chunk_norm or _super_clean(ck_norm) in _super_clean(chunk_norm):
+                return 1 # Minimal score for chunk-level context keyword match
+            
+    return CONTEXT_WEIGHTS["NONE"]
+
+def get_keyword_density(line, keywords):
+    score = 0
+    line_lower = line.lower()
+    for k in keywords:
+        if k in line_lower:
+            score += KEYWORD_WEIGHTS.get(k, 1)
+    return score
+
+def deduplicate_signals(signals):
+    if not signals: return []
+    seen = {}
+    for s in signals:
+        key = (s["norm_label"], s["value"])
+        if key not in seen:
+            s["frequency"] = 1
+            seen[key] = s
+        else:
+            seen[key]["frequency"] += 1
+            # Keep the one with higher base score
+            if s["score"] > seen[key]["score"]:
+                # Save existing frequency
+                freq = seen[key]["frequency"]
+                seen[key] = s
+                seen[key]["frequency"] = freq
+    return list(seen.values())
+
+def clean_text(text):
+    if not text: return ""
+    text = normalize_numbers(text)
+    text = text.replace('\n', ' ')
+    text = re.sub(r'\s+', ' ', text)
+    # Keep Devanagari, digits, and currency symbols
+    text = re.sub(r'[^\u0900-\u097F0-9A-Za-z₹.,:-]', ' ', text)
+    return text.strip()
+
+def resolve_context(signals, query_hint=""):
+    if not signals: return None, "NONE"
+    
+    # Normalize query hint for selection
+    query_norm = _normalize(query_hint)
+    
+    # Multi-factor scoring final pass
+    for s in signals:
+        # Confidence Score = (Base Score * 0.7) + (Frequency Bonus * 0.3)
+        # Max frequency bonus capped at 3 matches
+        freq_bonus = min(s.get("frequency", 1), 3) * 2
+        s["final_confidence_score"] = s["score"] + freq_bonus
+        
+        # Position Bonus (handled in execute_extraction)
+        
+    # Deduction/Selection Layer
+    # 1. Look for signals that match query context exactly
+    best_context_match = None
+    for s in signals:
+        if s["norm_label"] != "none" and s["norm_label"] in query_norm:
+            if not best_context_match or s["final_confidence_score"] > best_context_match["final_confidence_score"]:
+                best_context_match = s
+
+    if best_context_match:
+        # If it's a specific context match, confidence is likely HIGH if score is decent
+        confidence = "HIGH" if best_context_match["final_confidence_score"] > 15 else "MEDIUM"
+        return best_context_match, confidence
+
+    # 2. Fallback to highest overall confidence score
+    ranked = sorted(signals, key=lambda x: x["final_confidence_score"], reverse=True)
+    best = ranked[0]
+    
+    if best["final_confidence_score"] > 18:
+        confidence = "HIGH"
+    elif best["final_confidence_score"] > 10:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
+        
+    return best, confidence
+
+def execute_extraction(chunks, intents, query_hint=""):
+    """Production-Grade Multi-Intent Extractor (v7)"""
+    if isinstance(intents, str): intents = [intents]
+    
+    reasoning_steps = [
+        f"Detected Intents: {', '.join(intents)}",
+        "Analyzing retrieved documents with intent-specific gating..."
+    ]
+    
+    signals = []
+    
+    for chunk in chunks:
+        chunk_text = chunk.get("text", "")
+        # Use simpler splitting to preserve context
+        lines = [ln.strip() for ln in re.split(r'[\n|।]', chunk_text) if len(ln.strip()) > 5]
+        
+        for line in lines:
+            # 1. OCR Noise Filter (Aggressive)
+            if not is_clean_text(line):
+                continue
+                
+            line_cleaned = clean_text(line)
+            
+            # 2. Intent Routing & Strict Gating
+            for intent in intents:
+                val = None
+                label = "Value"
+                
+                if intent == "DEPOSIT" and is_deposit_line(line_cleaned):
+                    val = extract_amount(line_cleaned)
+                    label = "Deposit"
+                elif intent == "SIZE" and is_size_line(line_cleaned):
+                    val = extract_size(line_cleaned)
+                    label = "Size"
+                elif intent == "PERSON_DETAILS" and is_person_line(line_cleaned):
+                    val = extract_person_details(line_cleaned)
+                    label = "Details"
+                
+                if val:
+                    # 3. Validation Rules (e.g. range checks)
+                    if intent == "DEPOSIT":
+                        try:
+                            v_float = float(val.replace(',', ''))
+                            if not (500 <= v_float <= 10000000): val = None
+                        except: val = None
+                    elif intent == "SIZE":
+                        try:
+                            v_float = float(val.replace(',', ''))
+                            if not (5 <= v_float <= 100000): val = None
+                        except: val = None
+
+                if val:
+                    signals.append({
+                        "value": val,
+                        "norm_label": label.lower(),
+                        "raw_label": label,
+                        "intent": intent,
+                        "line": line.strip(),
+                        "score": 10.0,
+                        "file": chunk["filename"],
+                        "page": (chunk.get("metadata") or {}).get("page_number", "?")
+                    })
+
+    if signals:
+        reasoning_steps.append(f"Successfully extracted {len(signals)} valid signals.")
+    else:
+        reasoning_steps.append("No matching information found after strict gating.")
+
+    deduped = deduplicate_signals(signals)
+    best_signal, confidence = resolve_context(deduped, query_hint)
+    
+    if best_signal:
+        best_signal["confidence"] = confidence
+        best_signal["all_signals"] = deduped
+        best_signal["reasoning_steps"] = reasoning_steps
+        
+    return best_signal
+
+def detect_intents(query: str) -> list[str]:
+    """Multi-intent detection (v8) - Document Understanding Optimized"""
     q = query.lower()
     intents = []
-    if re.search(r'agency|contractor|firm|company|thekedar', q):
-        intents.append("Agency Name")
-    if re.search(r'casting|cast\b|date of cast', q):
-        intents.append("Date of Casting")
-    if re.search(r'testing|test\s+date|tested', q):
-        intents.append("Date of Testing")
-    if re.search(r'work order|w\.?o\.\b|order number', q):
-        intents.append("W.O. Number")
-    if re.search(r'\bref\b|reference|case no', q):
-        intents.append("Ref. Number")
-    if re.search(r'division|vibhag', q):
-        intents.append("Name of Division")
-    if re.search(r'bhukhand|भूखंड|भूखण्ड|bhu.?khand|plot|sankhya|संख्या', q):
-        intents.append("Plot Number")
-    if re.search(r'size|akar|आकार|area|maap|माप|varg|वर्ग|sqm|sq|gaj|गज|kshetrafal|क्षेत्रफल|saiz|साइज', q):
-        intents.append("Plot Size")
-    if re.search(r'jama|जमा|rashi|राशि|deposit|amount|rakam|रकम|shulk|शुल्क|kitni|amanat|अमानत|biana|बयाना', q):
-        intents.append("Deposit Amount")
-    if re.search(r'yojana|योजना|scheme|nagar|tilak|colony|kalani|कालोनी', q):
-        intents.append("Scheme Name")
-    if re.search(r'allot|आवंति|patta|पट्टा|holder|khattedar|पट्टेदार|malik|मालिक', q):
-        intents.append("Allottee Name")
-    if re.search(r'bid\s*no|bid\s*number|nit\s*no', q):
-        intents.append("Ref. Number")
-    elif re.search(r'tender|bid\s*amount|l1\b|lowest|contract\s*price|kitne\s*rupay|kitna\s*amount', q):
-        intents.append("Tender Amount")
-    elif re.search(r'\bbid\b|amount', q):
-        intents.append("Tender Amount")
-    if re.search(r'below\s*schedule|schedule|discount|percent|%|kitna\s*kam|rate', q):
-        intents.append("Schedule Discount")
-    if re.search(r'maturity|matur|due\s*date|mature|kab\s*mature|fd\s*kab', q):
-        intents.append("Maturity Date")
-    if re.search(r'fd\s*account|account\s*no|account\s*number|fd\s*number|receipt\s*no', q):
-        intents.append("FD Account No")
-    # Bid existence — separate check used by SQLite fast path
-    if re.search(r'bid\s*kiya|participated|participate|kiya\s*hai|ne\s*bid', q):
-        intents.append("Bid Existence")
-    # List bidders
-    if re.search(r'sare\s*bidder|list.*bidder|bidder.*list|kaun.*bid|saare.*participant', q):
-        intents.append("list_bidders")
-    return intents
+    
+    # DEPOSIT Intents
+    if re.search(r"(अमानत|जमानत|deposit|emd|money|rashi|रकम|राशि|money|रुपये|rs|₹|inr|शुल्क)", q):
+        intents.append("DEPOSIT")
+        if "आवासीय" in q or "residential" in q or "home" in q or "aawasiya" in q:
+            intents.append("DEPOSIT_RESIDENTIAL")
+        if "वाणिज्य" in q or "commercial" in q or "shop" in q or "business" in q:
+            intents.append("DEPOSIT_COMMERCIAL")
+        
+    # SIZE Intent
+    if re.search(r"(नाप|size|area|वर्ग|gaz|sq|metre|meter|क्षेत्रफल|माप|sqm|sqft|kshetrafal|आकार)", q):
+        intents.append("SIZE")
+        
+    # PLOT/DOCUMENT Intent
+    if re.search(r"(भूखंड|भूखण्ड|bhu\s*khand|plot|पट्टी|pattadar|पट्टाधारी|allottee|file|document|reciept)", q):
+        intents.append("PLOT")
+
+    # PERSON_DETAILS Intent
+    if re.search(r"(पिता|father|address|पता|allottee|नाम|agency|contractor| agency|owner|धारक|स्वामी|malik)", q):
+        intents.append("PERSON_DETAILS")
+        
+    return list(set(intents)) if intents else ["UNKNOWN"]
+
+# Specialized Validators (Strict Gating)
+def is_deposit_line(line):
+    return any(k in line.lower() for k in ["अमानत", "जमानत", "emd", "deposit", "राशि", "रकम", "₹", "rs", "inr"])
+
+def is_size_line(line):
+    return any(k in line.lower() for k in ["क्षेत्रफल", "size", "area", "आकार", "varg", "वर्ग", "गज", "sqm", "sqft"])
+
+def is_person_line(line):
+    return any(k in line.lower() for k in ["पिता", "father", "address", "पता", "पुत्र", "agency", "नाम"])
+
+# Specialized Extractors
+def extract_amount(line):
+    match = re.search(r'₹?\s*([\d,]{3,12})', line)
+    return match.group(1).strip() if match else None
+
+def extract_size(line):
+    match = re.search(r'([0-9.,]{1,10})\s*(?:sqm|sq\.?\s*m|वर्ग\s*मीटर|गज|gaj|sqft)', line, re.IGNORECASE)
+    return match.group(1).strip() if match else None
+
+def extract_person_details(line):
+    # Heuristic for person-related lines
+    if "पुत्र" in line or "father" in line:
+        return line.strip()
+    return None
+
+def filter_other_signals(all_signals, best_val):
+    """Returns a clean dict of {label: value} for ORV."""
+    result = {}
+    for s in all_signals:
+        label = s["raw_label"] or s["norm_label"] or "Signal"
+        val = s["value"]
+        
+        if val == best_val:
+            continue
+            
+        # Keep ONLY 1 per label, prioritizing higher score
+        if label not in result:
+            result[label] = val
+            
+    # Limit to 2 labels max
+    return dict(list(result.items())[:2])
+
+def build_strict_answer(result: dict) -> str:
+    if not result:
+        return "The required information was not found in the document."
+    
+    reasoning_steps = result.get("reasoning_steps", [])
+    reasoning_prefix = "\n".join(reasoning_steps) + "\n\n" if reasoning_steps else ""
+    
+    value = result["value"]
+    confidence = result["confidence"]
+    type_label = result.get("raw_label") or result.get("norm_label") or "Value"
+    
+    # Format value (No emojis in backend-generated strings)
+    ans = reasoning_prefix
+    ans += f"Answer: Rs.{value}" if "," in value or len(value) > 3 else f"Answer: {value}"
+    ans += f" (Type: {type_label.capitalize()})"
+    ans += f"\nConfidence: {confidence}"
+    
+    # Source attribution (Clickable Markdown Link)
+    source_rel = result["file"].replace("\\", "/")
+    source_name = source_rel.split("/")[-1]
+    page = result.get("page") or "1"
+    
+    # Logic to build the correct API link
+    source_url = f"/api/docs/samples/{source_rel}" if "/" in source_rel else f"/api/docs/uploads/{source_rel}"
+    if page != "?":
+        source_url += f"#page={page}"
+        ans += f"\nSource: [{source_name} (Page {page})]({source_url})"
+    else:
+        ans += f"\nSource: [{source_name}]({source_url})"
+    
+    # Other signals for transparency (ORV)
+    all_signals = result.get("all_signals", [])
+    orv = filter_other_signals(all_signals, value)
+    
+    if orv:
+        ans += "\n\nOther Relevant Values:"
+        for label, val in orv.items():
+            ans += f"\n- {label.capitalize()}: {val}"
+
+    # Show context for non-HIGH confidence
+    if confidence != "HIGH":
+        ans += f"\n\nContext Trace: {result['line']}"
+        
+    return ans
 
 
 def extract_work_title(text: str) -> str:
@@ -1208,42 +1606,30 @@ def build_natural_answer(
     sources: list[str],
     context_chunks: list[dict]
 ) -> str:
-    intents = detect_intent(query)
-
-    work_title = ""
-    for chunk in context_chunks:
-        work_title = extract_work_title(clean_ocr_text(chunk["text"]))
-        if work_title:
-            break
-
-    source_str = sources[0].split("/")[-1].strip() if sources else "the indexed document"
     paragraphs = []
 
-    if work_title:
-        paragraphs.append(f"**{source_str}** — *\"{work_title[:90]}\"*")
-    else:
-        paragraphs.append(f"**{source_str}** se yeh jankari mili:")
-
     _FIELD_LABELS = {
-        "Agency Name":       "🏗️ **Contractor / Agency**",
-        "Date of Casting":   "📅 **Casting Date**",
-        "Date of Testing":   "📈 **Testing Date**",
-        "W.O. Number":       "📄 **Work Order No.**",
-        "Ref. Number":       "🔗 **Reference No.**",
-        "Name of Division":  "🏛️ **Division**",
-        "Plot Number":       "📌 **भूखंड संख्या (Plot No.)**",
-        "Plot Size":         "📐 **भूखंड का आकार (Plot Size)**",
-        "Deposit Amount":    "💰 **जमाराशि (Deposit Amount)**",
-        "Scheme Name":       "🌅 **योजना (Scheme)**",
-        "Allottee Name":     "👤 **आवंती / पट्टेदार (Allottee)**",
-        "Tender Amount":     "💵 **Tender Amount (L1)**",
-        "Schedule Discount": "ℹ️ **Schedule Discount**",
-        "Maturity Date":     "📅 **FD Maturity Date**",
-        "FD Account No":     "🏦 **FD Account No.**",
+        "Agency Name":       "Contractor / Agency",
+        "Date of Casting":   "Casting Date",
+        "Date of Testing":   "Testing Date",
+        "W.O. Number":       "Work Order No.",
+        "Ref. Number":       "Reference No.",
+        "Name of Division":  "Division",
+        "Plot Number":       "Plot No.",
+        "Plot Size":         "Plot Size",
+        "Deposit Amount":    "Earnest Money (General)",
+        "Deposit (Residential)": "Earnest Money (Residential)",
+        "Deposit (Commercial)": "Earnest Money (Commercial)",
+        "Scheme Name":       "Scheme",
+        "Allottee Name":     "Allottee",
+        "Tender Amount":     "Tender Amount (L1)",
+        "Schedule Discount": "Schedule Discount",
+        "Maturity Date":     "FD Maturity Date",
+        "FD Account No":     "FD Account No.",
     }
 
     def _format_val(field, val):
-        if field == "Deposit Amount":
+        if "Deposit" in field:
             return f"₹{val}"
         if field == "Tender Amount":
             try:
@@ -1253,41 +1639,36 @@ def build_natural_answer(
         return str(val)
 
     def _fmt_field(field, val):
-        label = _FIELD_LABELS.get(field, f"**{field}**")
-        return f"- {label}: **{_format_val(field, val)}**"
+        label = _FIELD_LABELS.get(field, field)
+        return f"{label}: {_format_val(field, val)}"
 
     answered = []
-    missing  = []
-    real_intents = [f for f in intents if f not in ("Bid Existence", "list_bidders")]
-    for field in real_intents:
-        val = all_info.get(field)
-        if val:
-            answered.append(_fmt_field(field, val))
-        else:
-            missing.append(field)
-
-    extra = {k: v for k, v in all_info.items() if k not in real_intents and k != "Source"}
+    # Identify fields to return
+    # If it's a specific intent query, only return that. If not, return all found.
+    intents = detect_intents(query)
+    real_intents = [f for f in intents if f in _FIELD_LABELS]
+    
+    if real_intents:
+        for field in real_intents:
+            val = all_info.get(field)
+            if val:
+                answered.append(_fmt_field(field, val))
+    else:
+        # If no specific intent, return all extracted valid fields
+        for field, label in _FIELD_LABELS.items():
+            val = all_info.get(field)
+            if val:
+                answered.append(_fmt_field(field, val))
 
     if answered:
-        paragraphs.append("\n".join(answered))
-        if extra:
-            paragraphs.append(
-                "**Aur bhi details mili:**\n" +
-                "\n".join(_fmt_field(k, v) for k, v in extra.items()))
-        if missing:
-            paragraphs.append(
-                "> ⚠️ Yeh fields is document mein nahi mili: " +
-                ", ".join(f"_{f}_" for f in missing))
-    elif not real_intents:
-        paragraphs.append(
-            "> ⚠️ Answer not found in document. (Query intent not recognized)."
-        )
+        paragraphs.append("Answer: " + ", ".join(answered))
+        if sources:
+            source_file = sources[0].split("/")[-1].strip()
+            paragraphs.append(f"Source File: {source_file}")
     else:
-        paragraphs.append(
-            "> ⚠️ Maafi chahta hoon, yeh jankari indexed documents mein "
-            "nahi mili. PDF ko re-scan karein ya alag query try karein.")
+        return "The required information was not found in the document."
 
-    return "\n\n".join(paragraphs)
+    return "\n".join(paragraphs)
 
 
 # ---------------------------------------------------------------------------
@@ -1453,85 +1834,7 @@ def _llm_answer(query: str, chunks: list[dict], extracted_fields: dict = None,
         return None
 
 
-def format_answer(query: str, chunks: list[dict]) -> str:
-    all_info: dict = {}
-    sources:  list = []
 
-    def _scan_chunk(chunk):
-        nonlocal all_info
-        text = clean_ocr_text(chunk["text"])
-        if not text:
-            return
-        info = extract_key_info(text)
-        for k, v in keyword_scan(text).items():
-            if k not in info:
-                info[k] = v
-        for k, v in info.items():
-            if k not in all_info:
-                all_info[k] = v
-
-    reranked_chunks = _rerank_chunks(query, chunks, top_n=RERANK_TOP_N)
-
-    for chunk in reranked_chunks:
-        _scan_chunk(chunk)
-        fname   = chunk["filename"]
-        parts   = fname.replace("\\", "/").split("/")
-        display = " / ".join(parts[-3:]) if len(parts) >= 3 else fname
-        if display not in sources:
-            sources.append(display)
-
-    intents = detect_intent(query)
-    is_bid_existence = "Bid Existence" in intents
-
-    real_intents    = [f for f in intents if f != "Bid Existence"]
-    missing_intents = [f for f in real_intents if f not in all_info]
-    
-    # Removed Pass-2 brute-force scanning (e.g. 1269 chunks file-scan) to strictly adhere 
-    # to Production RAG architecture: Hybrid search -> Top 20 -> Rerank Top 5 -> LLM Answer
-
-    # --- Smart Fallback to LLM ---
-    from config import LLM_ENABLED
-    
-    # Trigger LLM if: 
-    # 1. We specifically looked for something but missed it completely
-    # 2. Or if there were no structured intents detected at all (custom question)
-    missing_intents_after_pass2 = [f for f in real_intents if f not in all_info]
-    llm_triggered = False
-    
-    if LLM_ENABLED and (missing_intents_after_pass2 or not intents):
-        print(f"  [fallback] Using LLM for deep parsing. Missing: {missing_intents_after_pass2}, Intents: {intents}")
-        llm_resp = _llm_answer(query, reranked_chunks, extracted_fields=all_info)
-        if llm_resp:
-            llm_triggered = True
-            # Overwrite natural answer to just return the LLM's response + sources
-            return llm_resp + f"\n\n**(Sources: {', '.join(sources)})**"
-
-    if not llm_triggered:
-        return build_natural_answer(query, all_info, sources, reranked_chunks)
-
-
-def build_detail_text(chunks: list[dict]) -> str:
-    sections = []
-    seen_files: set = set()
-    for chunk in chunks[:6]:
-        fname = chunk["filename"]
-        short = fname.replace("\\", "/").split("/")[-1]
-        text  = clean_ocr_text(chunk["text"])
-        if not text:
-            continue
-        
-        score_val = chunk.get('score', 0)
-        if score_val > 0:
-            header = f"### {short}  (relevance: {score_val:.0%})\n"
-        else:
-            header = f"### {short}\n"
-            
-        if short not in seen_files:
-            seen_files.add(short)
-            sections.append(header + text[:800])
-        else:
-            sections.append(text[:400])
-    return "\n\n---\n\n".join(sections)
 
 
 def answer_query(
@@ -1539,122 +1842,76 @@ def answer_query(
     filename_filter: str | None = None,
     category_filter: str | None = None,
 ):
-    """Refined entry point for Land Record Chatbot with Proactive Questioning."""
-    from database import (
-        query_by_plot, query_by_allottee, get_all_fields_for_file, write_audit
-    )
+    """Production-Grade Deterministic RAG - Structure-Aware Config-Driven Engine."""
+    from database import query_by_plot
+    from config import LLM_ENABLED
 
-    # 1. NORMALIZE & DETECT HINGLISH INTENT
-    # This handles "plot number xyz is approved or not?" or "village name me kitne plot hai?"
-    query, correction_note = normalize_query(query)
-    intents = detect_intent(query)
-    asked_plot = extract_plot_number_from_query(query)
+    # 1. NORMALIZE
+    norm_query, _ = normalize_query(query)
+    asked_plot = extract_plot_number_from_query(norm_query)
 
     # -----------------------------------------------------------------------
-    # PROACTIVE LOGIC: Requirement 1 (Self-Questioning)
+    # FAST PATH: SQL Structured Metadata Lookup (for Plot queries)
     # -----------------------------------------------------------------------
-    # If query is too short or lacks specific keywords, suggest critical land checks
-    critical_keywords = ["stay", "loan", "rc", "mismatch", "recovery", "acquisition"]
-    if len(query.split()) < 4 and not any(k in query.lower() for k in critical_keywords):
-        proactive_msg = (
-            f"Mujhe Plot/Khasra **{asked_plot if asked_plot else ''}** ki file mil gayi hai. \n\n"
-            "Kya aap is property ke baare mein ye jaanna chahte hain:\n"
-            "1. “Kya is khasra/plotno par kisi bhi prakaar ka stay order currently active hai?”\n"
-            "2. “Is property ke khilaf kisi bhi prakar ki revenue recovery (RC) pending hai?”\n"
-            "3. “Is land par abhi tak koi government acquisition notice issue hua hai?”"
-        )
-        yield {"type": "content", "content": proactive_msg}
-        return
-
-    # -----------------------------------------------------------------------
-    # FAST PATH: SQL Structured Metadata Lookup
-    # -----------------------------------------------------------------------
-    db_rows = []
+    # Keeping SQL fast path as a reliable data source for plot numbers
     if asked_plot:
         db_rows = query_by_plot(asked_plot)
-    
-    if db_rows:
-        row = db_rows[0]
-        # LOGIC FOR REQUIREMENT 5: Area Mismatch Detection
-        # Compare DB value vs what user thinks (if mentioned in query)
-        user_area_match = re.search(r"(\d+(\.\d+)?) hectare", query.lower())
-        if user_area_match and row.get("land_area_recorded"):
-            user_val = float(user_area_match.group(1))
-            db_val = float(row["land_area_recorded"])
-            if abs(user_val - db_val) > 0.01:
-                correction_note = (
-                    f"⚠️ **Data Mismatch Detected:** Aapne {user_val} hectare pucha hai, "
-                    f"lekin sarkari record (PDF) mein ye **{db_val} hectare** dikh raha hai."
-                )
-
-        # Build answer from SQL
-        fields = {k: v for k, v in row.items() if v and k not in ['id', 'file_hash']}
-        table_data = [{**fields, "Source": row['filename'].split("/")[-1]}]
-        answer_text = build_natural_answer(query, fields, [row['filename']], [])
-        
-        if correction_note:
-            answer_text = correction_note + "\n\n" + answer_text
-
-        yield {"type": "meta", "table": table_data, "sources": [row['filename']], "context_count": 0}
-        yield {"type": "content", "content": answer_text}
-        return
+        if db_rows:
+            row = db_rows[0]
+            fields = {k: v for k, v in row.items() if v and k not in ['id', 'file_hash']}
+            
+            # Simple fallback for fast path formatting
+            # Multi-intent check for SQL path
+            intents = detect_intents(norm_query)
+            if intents and any(i in fields for i in intents):
+                results = []
+                for i in intents:
+                    if i in fields:
+                        results.append(f"{i.capitalize()}: {fields[i]}")
+                answer_text = f"Answer: {', '.join(results)}\nSource File: {row['filename'].split('/')[-1]}"
+            else:
+                # Summary if no specific intent
+                summary = ", ".join([f"{k}: {v}" for k, v in fields.items() if k != 'filename'])
+                answer_text = f"Answer: {summary}\nSource File: {row['filename'].split('/')[-1]}"
+            
+            yield {
+                "type": "meta", 
+                "table": [{**fields, "Source": row['filename'].split("/")[-1]}], 
+                "sources": [row['filename']], 
+                "context_count": 0
+            }
+            yield {"type": "content", "content": answer_text}
+            return
 
     # -----------------------------------------------------------------------
-    # HYBRID PATH: For complex/historical queries (Requirement 1, 4, 8)
+    # PRODUCTION ENGINE: Config-Driven Discovery from chunks
     # -----------------------------------------------------------------------
-    context_chunks = retrieve_context(query, filename_filter, category_filter)
+    context_chunks = retrieve_context(norm_query, filename_filter, category_filter)
 
     if not context_chunks:
-        yield {"type": "error", "content": "Records nahi mile. Kripya sahi se jaankaari likhein."}
+        yield {"type": "content", "content": "The required information was not found in the document."}
         return
 
-    # -----------------------------------------------------------------------
-    # AGENTIC LLM LAYER: For Requirement 10 (Legal Risk) & Requirement 4 (SC/ST)
-    # -----------------------------------------------------------------------
-    # We use the LLM to 'reason' over the OCR text extracted from NS.pdf/CS.pdf
-    # Aggressive truncation for Phi-3's 2048 token limit (Hindi chars eat more tokens)
-    formatted_context = ""
-    for i, c in enumerate(context_chunks[:3], 1):
-        text_snippet = (c.get("text") or c.get("content") or "")[:300].strip()
-        formatted_context += f"[Doc {i}: {c.get('filename', 'Unknown')}]\n{text_snippet}\n\n"
-
-    llm_prompt = f"""Context:
-{formatted_context}
-User Query: {query}
-Role: Expert Land Records & Legal Document Analyzer.
-Instructions:
-1. Analyze OCR text. If info not found, say "Mujhe ye jaankari nahi mili."
-2. Check for Legal Risk (Stay, Court, Vivad).
-3. Explain local terms (Khasra, Mutation).
-4. Check SC/ST ownership transfer restrictions.
-5. Answer in Hinglish.
-"""
+    intents = detect_intents(norm_query)
     
-    # Try LLM first (if enabled), fall back to regex extraction
-    answer_text = _llm_answer(query, context_chunks, custom_prompt=llm_prompt)
-    
-    # Fallback to regex extraction if LLM is disabled or failed
-    if answer_text is None:
+    if "UNKNOWN" not in intents:
+        # Generic executor driven by multi-intent list
+        result = execute_extraction(context_chunks, intents, query_hint=norm_query)
+        answer_text = build_strict_answer(result)
+    else:
+        # Fallback to general scan
         all_info = {}
-        sources = []
-        for chunk in context_chunks[:5]:  # Process top 5 chunks
-            text = clean_ocr_text(chunk.get("text", ""))
-            if text:
-                info = extract_key_info(text)
-                for k, v in keyword_scan(text).items():
-                    if k not in info:
-                        info[k] = v
-                for k, v in info.items():
-                    if k not in all_info:
-                        all_info[k] = v
-            
-            fname = chunk["filename"]
-            parts = fname.replace("\\", "/").split("/")
-            display = " / ".join(parts[-3:]) if len(parts) >= 3 else fname
-            if display not in sources:
-                sources.append(display)
+        for chunk in context_chunks[:5]:
+            # extract_key_info still used as a fallback for general document overview
+            info = extract_key_info(chunk["text"])
+            for k, v in info.items():
+                if k not in all_info: all_info[k] = v
         
-        answer_text = build_natural_answer(query, all_info, sources, context_chunks)
+        if all_info:
+            ans_parts = [f"{k}: {v}" for k, v in all_info.items()]
+            answer_text = f"Answer: {', '.join(ans_parts)}\nSource File: {context_chunks[0]['filename'].split('/')[-1]}"
+        else:
+            answer_text = "The required information was not found in the document."
 
     yield {
         "type": "meta",
